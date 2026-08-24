@@ -221,6 +221,7 @@ int main() {
 
     auto cancelledOwner = makeRequest(9, 50, 901);
     EXPECT(thread->enqueue(std::move(cancelledOwner)).has_value(), false);
+    EXPECT(!!cancelledOwner, true);
 
     auto future       = makeRequest(8, 40, 800);
     future->submitAt  = std::chrono::steady_clock::now() + 1h;
@@ -244,6 +245,7 @@ int main() {
 
     auto rejected = makeRequest(10, 50, 1000);
     EXPECT(thread->enqueue(std::move(rejected)).has_value(), false);
+    EXPECT(!!rejected, true);
 
     auto deadlineSubmitter    = makeUnique<CFakeCommitSubmitter>();
     auto deadlineSubmitterPtr = deadlineSubmitter.get();
@@ -309,6 +311,49 @@ int main() {
     EXPECT(stopping.wait_for(2s) == std::future_status::ready, true);
     const auto STOP_RESULTS = stopping.get();
     EXPECT(resultFor(STOP_RESULTS, ACTIVE_STOP)->status, CDRMCommitThread::AQ_DRM_COMMIT_THREAD_SUBMITTED);
+
+    auto barrierSubmitter    = makeUnique<CFakeCommitSubmitter>();
+    auto barrierSubmitterPtr = barrierSubmitter.get();
+    auto barrierThread       = CDRMCommitThread::create(std::move(barrierSubmitter));
+    EXPECT(!!barrierThread, true);
+
+    EXPECT(barrierThread->pauseQueue(0), false);
+    EXPECT(barrierThread->resumeQueue(0), false);
+    EXPECT(barrierThread->pauseQueue(120), true);
+    EXPECT(barrierThread->pauseQueue(120), true);
+
+    auto paused           = makeRequest(17, 120, 1700);
+    paused->blocksQueue   = false;
+    const auto PAUSED     = enqueue(*barrierThread, std::move(paused));
+    auto       unpaused   = makeRequest(18, 130, 1800);
+    unpaused->blocksQueue = false;
+    const auto UNPAUSED   = enqueue(*barrierThread, std::move(unpaused));
+    EXPECT(PAUSED != 0, true);
+    EXPECT(UNPAUSED != 0, true);
+    EXPECT(barrierSubmitterPtr->waitForSubmissions(1), true);
+    EXPECT(barrierSubmitterPtr->submittedIDs().at(0), UNPAUSED);
+    EXPECT(barrierSubmitterPtr->waitForSubmissions(2, 20ms), false);
+
+    EXPECT(barrierThread->resumeQueue(120), true);
+    EXPECT(barrierSubmitterPtr->waitForSubmissions(2, 20ms), false);
+    EXPECT(barrierThread->resumeQueue(120), true);
+    EXPECT(barrierSubmitterPtr->waitForSubmissions(2), true);
+    EXPECT(barrierSubmitterPtr->submittedIDs().at(1), PAUSED);
+    EXPECT(barrierThread->resumeQueue(120), false);
+
+    barrierSubmitterPtr->block();
+    auto activeBarrier         = makeRequest(19, 140, 1900);
+    activeBarrier->blocksQueue = false;
+    EXPECT(enqueue(*barrierThread, std::move(activeBarrier)) != 0, true);
+    EXPECT(barrierSubmitterPtr->waitForSubmissions(3), true);
+
+    auto pausing = std::async(std::launch::async, [&barrierThread] { return barrierThread->pauseQueue(140); });
+    EXPECT(pausing.wait_for(20ms) == std::future_status::timeout, true);
+    barrierSubmitterPtr->unblock();
+    EXPECT(pausing.wait_for(2s) == std::future_status::ready, true);
+    EXPECT(pausing.get(), true);
+    EXPECT(barrierThread->resumeQueue(140), true);
+    barrierThread->stopAndDrain();
 
     return ret;
 }

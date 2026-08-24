@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <format>
 #include <hyprutils/math/Mat3x3.hpp>
+#include <hyprutils/memory/Atomic.hpp>
 #include <hyprutils/string/VarList.hpp>
 #include <chrono>
 #include <thread>
@@ -16,6 +17,7 @@
 #include <cstring>
 #include <filesystem>
 #include <system_error>
+#include <utility>
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -36,6 +38,7 @@ extern "C" {
 #include "hwdata.hpp"
 #include "Renderer.hpp"
 #include "OutputTiming.hpp"
+#include "AsyncCommit.hpp"
 
 #include <hyprutils/utils/ScopeGuard.hpp>
 using Hyprutils::Utils::CScopeGuard;
@@ -63,7 +66,12 @@ Aquamarine::CDRMBackend::CDRMBackend(SP<CBackend> backend_) : backend(backend_) 
         if (backend->session->active) {
             // session got activated, we need to restore
             restoreAfterVT();
-        }
+        } else
+            for (const auto& connector : connectors) {
+                if (connector->output)
+                    cancelAsyncOutput(connector->output.get(), true);
+                connector->invalidateFrame();
+            }
     });
 }
 
@@ -372,6 +380,8 @@ std::vector<SP<CDRMBackend>> Aquamarine::CDRMBackend::attempt(SP<CBackend> backe
 }
 
 Aquamarine::CDRMBackend::~CDRMBackend() {
+    stopCommitThread();
+
     for (auto& conn : connectors) {
         conn->disconnect();
         conn.reset();
@@ -382,6 +392,197 @@ Aquamarine::CDRMBackend::~CDRMBackend() {
 
     rendererState.renderer.reset();
     rendererState.allocator.reset();
+}
+
+bool Aquamarine::CDRMBackend::initCommitThread() {
+    if (commitThread)
+        return true;
+
+    commitThread = CDRMCommitThread::create(makeDRMCommitSubmitter(gpu->fd));
+    return !!commitThread;
+}
+
+void Aquamarine::CDRMBackend::stopCommitThread() {
+    if (!commitThread)
+        return;
+
+    flushAsyncCommitEvents();
+    auto RESULTS = commitThread->stopAndDrain();
+    for (auto& result : RESULTS) {
+        auto* DATA        = dynamic_cast<CDRMAsyncCommitData*>(result.request->data.get());
+        auto* ATOMIC_IMPL = dynamic_cast<CDRMAtomicImpl*>(impl.get());
+        if (!DATA || !DATA->request || !ATOMIC_IMPL)
+            continue;
+
+        const bool SUBMITTED = result.status == CDRMCommitThread::AQ_DRM_COMMIT_THREAD_SUBMITTED;
+        if (SUBMITTED)
+            DATA->mgpuAcquired = false;
+        ATOMIC_IMPL->finalizeAsync(*DATA->request, DATA->connector, DATA->commitData, SUBMITTED);
+
+        if (SUBMITTED && DATA->connector && DATA->output && DATA->connector->output == DATA->output) {
+            DATA->output->state->internalState.drmFormat = DATA->commitData.outputState.drmFormat;
+            DATA->connector->applyCommit(DATA->commitData);
+            for (const auto& fb : DATA->commitData.retiredFBs)
+                DATA->connector->releaseFBBuffer(fb);
+        }
+
+        if (!SUBMITTED)
+            DATA->rollbackMgpu();
+        DATA->releasePins();
+        if (!SUBMITTED && DATA->output && DATA->snapshot)
+            DATA->output->state->rearm(*DATA->snapshot);
+        if (DATA->output && DATA->output->pendingAsyncCommit == result.request->id) {
+            if (!SUBMITTED)
+                DATA->output->pendingAsyncCommit = 0;
+            DATA->output->events.commitResult.emit(IOutput::SCommitResult{
+                .id           = result.request->id,
+                .status       = SUBMITTED ? IOutput::AQ_OUTPUT_COMMIT_SUBMITTED :
+                                            (result.status == CDRMCommitThread::AQ_DRM_COMMIT_THREAD_CANCELLED ? IOutput::AQ_OUTPUT_COMMIT_CANCELLED : IOutput::AQ_OUTPUT_COMMIT_FAILED),
+                .error        = result.error,
+                .missedTarget = result.missedTarget,
+            });
+        }
+    }
+
+    commitThread.reset();
+}
+
+uint64_t Aquamarine::CDRMBackend::nextAsyncOwnerID() {
+    if (++m_lastAsyncOwnerID == 0)
+        ++m_lastAsyncOwnerID;
+    return m_lastAsyncOwnerID;
+}
+
+bool Aquamarine::CDRMBackend::pauseCommitQueue(uint64_t queueKey) {
+    if (!commitThread)
+        return true;
+
+    if (!commitThread->pauseQueue(queueKey))
+        return false;
+
+    dispatchCommitResults();
+    return true;
+}
+
+void Aquamarine::CDRMBackend::resumeCommitQueue(uint64_t queueKey) {
+    if (commitThread)
+        commitThread->resumeQueue(queueKey);
+}
+
+void Aquamarine::CDRMBackend::cancelAsyncOutput(CDRMOutput* output, bool renewOwner) {
+    if (!output || !output->asyncOwnerID)
+        return;
+
+    flushAsyncCommitEvents();
+    if (commitThread)
+        commitThread->cancelOwner(output->asyncOwnerID);
+    dispatchCommitResults();
+
+    if (renewOwner)
+        output->asyncOwnerID = nextAsyncOwnerID();
+}
+
+void Aquamarine::CDRMBackend::emitAsyncCommitEvent(SP<CDRMOutput> output) {
+    if (!output || !output->asyncCommitEventPending)
+        return;
+
+    output->asyncCommitEventPending = false;
+    if (m_pendingAsyncCommitEvents > 0)
+        --m_pendingAsyncCommitEvents;
+    output->events.commit.emit();
+
+    if (m_pendingAsyncCommitEvents == 0)
+        dispatchCommitResults();
+}
+
+void Aquamarine::CDRMBackend::flushAsyncCommitEvents() {
+    for (const auto& connector : connectors) {
+        if (connector->output && connector->output->asyncCommitEventPending)
+            emitAsyncCommitEvent(connector->output);
+    }
+}
+
+void Aquamarine::CDRMBackend::dispatchCommitResults() {
+    if (!commitThread || m_pendingAsyncCommitEvents > 0)
+        return;
+
+    auto* atomicImpl = dynamic_cast<CDRMAtomicImpl*>(impl.get());
+    auto  results    = commitThread->drainResults();
+    for (auto& result : results) {
+        auto* data = dynamic_cast<CDRMAsyncCommitData*>(result.request->data.get());
+        if (!data || !data->request || !atomicImpl)
+            continue;
+
+        const bool SUBMITTED = result.status == CDRMCommitThread::AQ_DRM_COMMIT_THREAD_SUBMITTED;
+        if (SUBMITTED)
+            data->mgpuAcquired = false;
+        atomicImpl->finalizeAsync(*data->request, data->connector, data->commitData, SUBMITTED);
+
+        const auto OUTPUT    = data->output;
+        const auto CONNECTOR = data->connector;
+        const auto CRTC      = CONNECTOR ? CONNECTOR->crtc : nullptr;
+
+        if (SUBMITTED && CONNECTOR && OUTPUT && CONNECTOR->output == OUTPUT) {
+            OUTPUT->state->internalState.drmFormat = data->commitData.outputState.drmFormat;
+            if (data->commitData.committed & COutputState::AQ_OUTPUT_STATE_EXPLICIT_OUT_FENCE)
+                OUTPUT->state->internalState.explicitOutFence = data->commitData.outputState.explicitOutFence;
+            CONNECTOR->applyCommit(data->commitData);
+            for (const auto& fb : data->commitData.retiredFBs)
+                CONNECTOR->releaseFBBuffer(fb);
+        }
+
+        if (!SUBMITTED)
+            data->rollbackMgpu();
+        data->releasePins();
+
+        const bool CURRENT = OUTPUT && result.request->ownerID == OUTPUT->asyncOwnerID && OUTPUT->pendingAsyncCommit == result.request->id;
+        if (!CURRENT) {
+            if (!SUBMITTED && CRTC) {
+                commitThread->releaseQueue(CRTC->id, result.request->id);
+                if (CRTC->pendingFlip.commitID == result.request->id)
+                    CRTC->disarmPageFlip();
+            }
+            continue;
+        }
+
+        IOutput::SCommitResult commitResult{
+            .id           = result.request->id,
+            .status       = SUBMITTED ? IOutput::AQ_OUTPUT_COMMIT_SUBMITTED :
+                                        (result.status == CDRMCommitThread::AQ_DRM_COMMIT_THREAD_CANCELLED ? IOutput::AQ_OUTPUT_COMMIT_CANCELLED : IOutput::AQ_OUTPUT_COMMIT_FAILED),
+            .error        = result.error,
+            .missedTarget = result.missedTarget,
+        };
+
+        if (!SUBMITTED) {
+            OUTPUT->pendingAsyncCommit = 0;
+            if (data->snapshot)
+                OUTPUT->state->rearm(*data->snapshot);
+            if (CRTC) {
+                commitThread->releaseQueue(CRTC->id, result.request->id);
+                if (CRTC->pendingFlip.commitID == result.request->id)
+                    CRTC->disarmPageFlip();
+            }
+            if (CONNECTOR)
+                CONNECTOR->sched.onFrameComplete();
+            OUTPUT->events.commitResult.emit(commitResult);
+            OUTPUT->scheduleFrame(IOutput::AQ_SCHEDULE_NEEDS_FRAME);
+            continue;
+        }
+
+        if (!CRTC || CRTC->pendingFlip.commitID != result.request->id) {
+            OUTPUT->pendingAsyncCommit = 0;
+            OUTPUT->events.commitResult.emit(commitResult);
+            continue;
+        }
+
+        CRTC->pendingFlip.resultReady = true;
+        const auto EARLY              = CRTC->pendingFlip.early;
+        const auto FLIP_ID            = *CRTC->pendingFlip.id;
+        OUTPUT->events.commitResult.emit(commitResult);
+
+        if (EARLY.valid)
+            handlePageFlip(FLIP_ID, EARLY.seq, EARLY.sec, EARLY.usec, CRTC->id);
+    }
 }
 
 void Aquamarine::CDRMBackend::log(eBackendLogLevel l, const std::string& s) {
@@ -556,6 +757,8 @@ bool Aquamarine::CDRMBackend::checkFeatures() {
         impl                         = makeShared<CDRMAtomicImpl>(self.lock());
         drmProps.supportsAsyncCommit = drmGetCap(gpu->fd, DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP, &cap) == 0 && cap == 1;
         atomic                       = true;
+        if (!initCommitThread())
+            backend->log(AQ_LOG_WARNING, "drm: Failed to create the asynchronous commit worker");
     }
 
     backend->log(AQ_LOG_DEBUG, std::format("drm: drmProps.supportsAsyncCommit: {}", drmProps.supportsAsyncCommit));
@@ -1162,7 +1365,10 @@ bool Aquamarine::CDRMBackend::start() {
 }
 
 std::vector<Hyprutils::Memory::CSharedPointer<SPollFD>> Aquamarine::CDRMBackend::pollFDs() {
-    return {makeShared<SPollFD>(gpu->fd, [this]() { dispatchEvents(); })};
+    std::vector<SP<SPollFD>> fds = {makeShared<SPollFD>(gpu->fd, [this]() { dispatchEvents(); })};
+    if (commitThread)
+        fds.emplace_back(makeShared<SPollFD>(commitThread->completionFD(), [this]() { dispatchCommitResults(); }));
+    return fds;
 }
 
 int Aquamarine::CDRMBackend::drmFD() {
@@ -1186,7 +1392,7 @@ SP<SDRMCRTC> Aquamarine::CDRMBackend::crtcByID(uint32_t id) {
     return it == crtcs.end() ? nullptr : *it;
 }
 
-uintptr_t Aquamarine::SDRMCRTC::armPageFlip(CWeakPointer<SDRMConnector> connector, bool async) {
+uintptr_t Aquamarine::SDRMCRTC::armPageFlip(CWeakPointer<SDRMConnector> connector, bool async, std::optional<uintptr_t> requestedID, uint64_t commitID, bool resultReady) {
     if (pendingFlip.id && !(pendingFlip.connector == connector)) {
         if (const auto PREV = pendingFlip.connector.lock()) {
             backend->log(AQ_LOG_ERROR, std::format("drm: crtc {} page-flip slot taken from {}, dropping its frame", id, PREV->szName));
@@ -1194,9 +1400,12 @@ uintptr_t Aquamarine::SDRMCRTC::armPageFlip(CWeakPointer<SDRMConnector> connecto
         }
     }
 
-    pendingFlip.id        = backend->nextPageFlipID();
-    pendingFlip.connector = connector;
-    pendingFlip.async     = async;
+    pendingFlip.id          = requestedID.value_or(backend->nextPageFlipID());
+    pendingFlip.connector   = connector;
+    pendingFlip.async       = async;
+    pendingFlip.commitID    = commitID;
+    pendingFlip.resultReady = resultReady;
+    pendingFlip.early.valid = false;
 
     return pendingFlip.id.value();
 }
@@ -1204,7 +1413,10 @@ uintptr_t Aquamarine::SDRMCRTC::armPageFlip(CWeakPointer<SDRMConnector> connecto
 void Aquamarine::SDRMCRTC::disarmPageFlip() {
     pendingFlip.id.reset();
     pendingFlip.connector.reset();
-    pendingFlip.async = false;
+    pendingFlip.async       = false;
+    pendingFlip.commitID    = 0;
+    pendingFlip.resultReady = true;
+    pendingFlip.early.valid = false;
 }
 
 static CWeakPointer<CDRMBackend> gDispatchingBackend;
@@ -1214,66 +1426,81 @@ static void                      handlePF(int fd, unsigned seq, unsigned tv_sec,
     if (!BACKEND || BACKEND->drmFD() != fd)
         return;
 
-    const auto FLIPID = rc<uintptr_t>(data);
-    const auto CRTC   = BACKEND->crtcByID(crtc_id);
+    BACKEND->handlePageFlip(rc<uintptr_t>(data), seq, tv_sec, tv_usec, crtc_id);
+}
 
-    if (!CRTC || !FLIPID || CRTC->pendingFlip.id != FLIPID) {
-        BACKEND->log(AQ_LOG_DEBUG, std::format("drm: Ignoring a stale pf event, flip {} on crtc {}", FLIPID, crtc_id));
+void Aquamarine::CDRMBackend::handlePageFlip(uintptr_t flipID, unsigned int seq, unsigned int sec, unsigned int usec, uint32_t crtcID) {
+    const auto CRTC = crtcByID(crtcID);
+    if (!CRTC || !flipID || CRTC->pendingFlip.id != flipID) {
+        log(AQ_LOG_DEBUG, std::format("drm: Ignoring a stale pf event, flip {} on crtc {}", flipID, crtcID));
+        return;
+    }
+
+    if (!CRTC->pendingFlip.resultReady) {
+        CRTC->pendingFlip.early = {
+            .valid = true,
+            .seq   = seq,
+            .sec   = sec,
+            .usec  = usec,
+        };
         return;
     }
 
     const auto CONNECTOR = CRTC->pendingFlip.connector.lock();
     const auto ASYNC     = CRTC->pendingFlip.async;
+    const auto COMMIT_ID = CRTC->pendingFlip.commitID;
     CRTC->disarmPageFlip();
 
+    if (commitThread && COMMIT_ID)
+        commitThread->releaseQueue(crtcID, COMMIT_ID);
+
     if (!CONNECTOR) {
-        BACKEND->log(AQ_LOG_DEBUG, "drm: Ignoring a pf event whose connector is gone");
+        log(AQ_LOG_DEBUG, "drm: Ignoring a pf event whose connector is gone");
         return;
     }
 
-    TRACE(BACKEND->log(AQ_LOG_TRACE, std::format("drm: pf event seq {} sec {} usec {} crtc {}", seq, tv_sec, tv_usec, crtc_id)));
+    if (CONNECTOR->output && CONNECTOR->output->pendingAsyncCommit == COMMIT_ID)
+        CONNECTOR->output->pendingAsyncCommit = 0;
+
+    TRACE(log(AQ_LOG_TRACE, std::format("drm: pf event seq {} sec {} usec {} crtc {}", seq, sec, usec, crtcID)));
 
     if (!CONNECTOR->sched.frameInFlight()) {
-        BACKEND->log(AQ_LOG_DEBUG, std::format("drm: Ignoring pf event on {}, no frame in flight?", CONNECTOR->szName));
+        log(AQ_LOG_DEBUG, std::format("drm: Ignoring pf event on {}, no frame in flight?", CONNECTOR->szName));
         return;
     }
 
     CONNECTOR->sched.onFrameComplete();
 
     if (CONNECTOR->status != DRM_MODE_CONNECTED || !CONNECTOR->crtc || !CONNECTOR->output) {
-        BACKEND->log(AQ_LOG_DEBUG, "drm: Ignoring a pf event from a disabled crtc / connector");
+        log(AQ_LOG_DEBUG, "drm: Ignoring a pf event from a disabled crtc / connector");
         return;
     }
 
-    // hold isFrameRunning around the emit (RAII pair, so reentrant enable/disable
-    // can't strand it).
     CFrameRunningGuard frameRunning(CONNECTOR->sched);
 
-    // a tearing commit already emitted present and rotated the FBs synchronously
-    if (!ASYNC) {
+    if (!ASYNC || COMMIT_ID) {
         CONNECTOR->onPresent();
 
-        uint32_t flags = IOutput::AQ_OUTPUT_PRESENT_VSYNC | IOutput::AQ_OUTPUT_PRESENT_HW_CLOCK | IOutput::AQ_OUTPUT_PRESENT_HW_COMPLETION | IOutput::AQ_OUTPUT_PRESENT_ZEROCOPY;
+        uint32_t flags = IOutput::AQ_OUTPUT_PRESENT_HW_CLOCK | IOutput::AQ_OUTPUT_PRESENT_HW_COMPLETION | IOutput::AQ_OUTPUT_PRESENT_ZEROCOPY;
+        if (!ASYNC)
+            flags |= IOutput::AQ_OUTPUT_PRESENT_VSYNC;
 
-        timespec presented = {.tv_sec = (time_t)tv_sec, .tv_nsec = (long)(tv_usec * 1000)};
+        timespec presented = {.tv_sec = sc<time_t>(sec), .tv_nsec = sc<long>(usec * 1000)};
 
-        // nvidia-drm registers no vblank counter, unless module options 'nvidia_drm vblank=1' is set.
-        // kernel checks for vblank support and fallbacks to setting seq 0 and the timestamp is a plain ktime_get()
-        // this is not a HW clock, its just a plain software clock fetched from whenever the event was called.
-        if (BACKEND->gpuDriver() == AQ_BACKEND_GPU_DRIVER_NVIDIA && seq == 0)
+        if (gpuDriver() == AQ_BACKEND_GPU_DRIVER_NVIDIA && seq == 0)
             flags &= ~IOutput::AQ_OUTPUT_PRESENT_HW_CLOCK;
 
         CONNECTOR->output->events.present.emit(IOutput::SPresentEvent{
-            .presented = BACKEND->sessionActive(),
+            .presented = sessionActive(),
             .when      = &presented,
             .seq       = seq,
-            .refresh   = (int)(CONNECTOR->refresh ? (1000000000000LL / CONNECTOR->refresh) : 0),
+            .refresh   = sc<int>(CONNECTOR->refresh ? (1000000000000LL / CONNECTOR->refresh) : 0),
             .flags     = flags,
+            .commitID  = COMMIT_ID,
         });
     }
 
-    // Skip if an idle frame is already queued: it emits events.frame itself, and #325 forbids double-firing.
-    if (BACKEND->sessionActive() && CONNECTOR->output->enabledState && !CONNECTOR->sched.frameScheduled())
+    if (sessionActive() && CONNECTOR->output->enabledState && !CONNECTOR->sched.frameScheduled())
         CONNECTOR->sched.frameReady.emit();
 }
 
@@ -1903,6 +2130,7 @@ void Aquamarine::SDRMConnector::disconnect() {
         return;
     }
 
+    backend->cancelAsyncOutput(output.get());
     invalidateFrame();
 
     status = DRM_MODE_DISCONNECTED;
@@ -2021,14 +2249,32 @@ void Aquamarine::SDRMConnector::applyCommit(SDRMConnectorCommitData& data) {
 void Aquamarine::SDRMConnector::invalidateFrame() {
     sched.invalidate();
 
-    if (crtc && crtc->pendingFlip.connector == self)
+    if (crtc && crtc->pendingFlip.connector == self) {
+        const auto COMMIT_ID = crtc->pendingFlip.commitID;
+        if (backend->commitThread && COMMIT_ID)
+            backend->commitThread->releaseQueue(crtc->id, COMMIT_ID);
         crtc->disarmPageFlip();
+
+        if (output && COMMIT_ID && output->pendingAsyncCommit == COMMIT_ID) {
+            output->pendingAsyncCommit = 0;
+
+            timespec when = {};
+            clock_gettime(CLOCK_MONOTONIC, &when);
+            output->events.present.emit(IOutput::SPresentEvent{
+                .presented = false,
+                .when      = &when,
+                .commitID  = COMMIT_ID,
+            });
+        }
+    }
 }
 
 void Aquamarine::SDRMConnector::setCRTC(SP<SDRMCRTC> newCRTC) {
     if (crtc == newCRTC)
         return;
 
+    if (output)
+        backend->cancelAsyncOutput(output.get(), true);
     invalidateFrame();
 
     crtc = newCRTC;
@@ -2063,6 +2309,8 @@ void Aquamarine::SDRMConnector::onPresent(bool primary, bool cursor, DRMFBList* 
 }
 
 Aquamarine::CDRMOutput::~CDRMOutput() {
+    if (backend)
+        backend->cancelAsyncOutput(this);
     if (backend && backend->backend)
         backend->backend->removeIdleEvent(frameIdle);
     connector->sched.onFrameComplete();
@@ -2081,16 +2329,158 @@ void Aquamarine::CDRMOutput::releaseMgpuResources() {
 }
 
 bool Aquamarine::CDRMOutput::commit() {
+    if (!connector->crtc)
+        return commitState();
+
+    const auto QUEUE_KEY = connector->crtc->id;
+    if (pendingAsyncCommit)
+        backend->cancelAsyncOutput(this, true);
+    if (pendingAsyncCommit)
+        return false;
+    if (!backend->pauseCommitQueue(QUEUE_KEY))
+        return false;
+    CScopeGuard resume([this, QUEUE_KEY] { backend->resumeCommitQueue(QUEUE_KEY); });
     return commitState();
 }
 
 bool Aquamarine::CDRMOutput::test() {
+    if (!connector->crtc)
+        return commitState(true);
+
+    const auto QUEUE_KEY = connector->crtc->id;
+    if (pendingAsyncCommit)
+        backend->cancelAsyncOutput(this, true);
+    if (pendingAsyncCommit)
+        return false;
+    if (!backend->pauseCommitQueue(QUEUE_KEY))
+        return false;
+    CScopeGuard resume([this, QUEUE_KEY] { backend->resumeCommitQueue(QUEUE_KEY); });
     return commitState(true);
 }
 
 void Aquamarine::CDRMOutput::setCursorVisible(bool visible) {
     cursorVisible = visible;
     scheduleFrame(AQ_SCHEDULE_CURSOR_VISIBLE);
+}
+
+bool Aquamarine::CDRMOutput::prepareAsyncCommitData(const COutputState::CSnapshot& snapshot, SDRMConnectorCommitData& data, Hyprutils::OS::CFileDescriptor& mgpuFence,
+                                                    bool& mgpuAcquired, bool& requiresSync) {
+    const auto& STATE = snapshot.state();
+
+    data.outputState   = STATE;
+    data.cursorPos     = cursorPos;
+    data.cursorHotspot = cursorHotspot;
+    data.cursorVisible = cursorVisible;
+
+    SP<CDRMFB> drmFB;
+    if (backend->shouldBlit()) {
+        if (!backend->rendererState.renderer) {
+            backend->log(AQ_LOG_DEBUG, "drm: No renderer attached to backend when required for asynchronous blitting, initializing");
+            if (!backend->initMgpu() || !backend->rendererState.renderer || !backend->rendererState.allocator) {
+                backend->log(AQ_LOG_ERROR, "drm: Failed to initialize renderer backend for asynchronous blitting");
+                return false;
+            }
+        }
+
+        if (!mgpu.swapchain)
+            mgpu.swapchain = CSwapchain::create(backend->rendererState.allocator, backend.lock());
+
+        auto       options = swapchain ? swapchain->currentOptions() : mgpu.swapchain->currentOptions();
+        const auto ATTRS   = snapshot.state().buffer->dmabuf();
+        options.size       = STATE.buffer->size;
+        if (options.format == DRM_FORMAT_INVALID)
+            options.format = ATTRS.format;
+        options.multigpu = false;
+        options.cursor   = false;
+        options.scanout  = true;
+        if (options.length == 0)
+            options.length = 2;
+
+        const auto& CURRENT = mgpu.swapchain->currentOptions();
+        if (CURRENT.length > 0 &&
+            (CURRENT.length != options.length || CURRENT.size != options.size || CURRENT.format != options.format || CURRENT.multigpu != options.multigpu ||
+             CURRENT.cursor != options.cursor || CURRENT.scanout != options.scanout)) {
+            requiresSync = true;
+            return false;
+        }
+
+        if (!mgpu.swapchain->reconfigure(options)) {
+            backend->log(AQ_LOG_ERROR, "drm: Asynchronous commit requires blit, but the mGPU swapchain failed reconfiguring");
+            return false;
+        }
+
+        const auto NEW_BUFFER = mgpu.swapchain->next(nullptr);
+        if (!NEW_BUFFER) {
+            backend->log(AQ_LOG_ERROR, "drm: Asynchronous commit requires blit, but the mGPU swapchain has no buffer");
+            return false;
+        }
+        mgpuAcquired = true;
+
+        SP<CDRMRenderer> primaryRenderer;
+        if (backend->primary)
+            primaryRenderer = backend->primary->rendererState.renderer;
+        const auto BLIT = backend->rendererState.renderer->blit(STATE.buffer, NEW_BUFFER, primaryRenderer,
+                                                                (STATE.committed & COutputState::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE) ? STATE.explicitInFence : -1);
+        if (!BLIT.success) {
+            backend->log(AQ_LOG_ERROR, "drm: Asynchronous commit requires blit, but blitting failed");
+            return false;
+        }
+
+        static const bool NO_EXPLICIT = envEnabled("AQ_MGPU_NO_EXPLICIT");
+        if (!BLIT.syncFD || NO_EXPLICIT || !supportsExplicit) {
+            requiresSync = true;
+            return false;
+        }
+
+        const int DUPLICATED_FENCE = fcntl(*BLIT.syncFD, F_DUPFD_CLOEXEC, 0);
+        if (DUPLICATED_FENCE < 0) {
+            backend->log(AQ_LOG_ERROR, std::format("drm: Failed to duplicate asynchronous mGPU fence: {}", strerror(errno)));
+            return false;
+        }
+
+        mgpuFence                        = Hyprutils::OS::CFileDescriptor{DUPLICATED_FENCE};
+        data.outputState.explicitInFence = mgpuFence.get();
+
+        drmFB = CDRMFB::create(NEW_BUFFER, backend, nullptr);
+    } else
+        drmFB = CDRMFB::create(STATE.buffer, backend, nullptr);
+
+    if (!drmFB || drmFB->dead) {
+        backend->log(AQ_LOG_ERROR, "drm: Asynchronous commit buffer failed to import to KMS");
+        return false;
+    }
+
+    data.mainFB = drmFB;
+    if (connector->crtc->pendingCursor)
+        data.cursorFB = connector->crtc->pendingCursor;
+    else if (connector->crtc->cursor)
+        data.cursorFB = connector->crtc->cursor->front;
+
+    if (data.cursorFB && (data.cursorFB->dead || data.cursorFB->buffer->dmabuf().modifier == DRM_FORMAT_MOD_INVALID))
+        data.cursorFB.reset();
+
+    const auto MODE = STATE.mode ? STATE.mode : STATE.customMode;
+    if (!MODE)
+        return false;
+
+    data.blocking  = false;
+    data.modeset   = false;
+    data.test      = false;
+    data.enabled   = true;
+    data.committed = STATE.committed;
+    if (mgpuFence.isValid())
+        data.committed |= COutputState::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE;
+    data.flags = DRM_MODE_PAGE_FLIP_EVENT;
+    if (STATE.presentationMode == AQ_OUTPUT_PRESENTATION_IMMEDIATE)
+        data.flags |= DRM_MODE_PAGE_FLIP_ASYNC;
+    if (STATE.committed & COutputState::AQ_OUTPUT_STATE_DAMAGE)
+        data.damage = STATE.damage.copy();
+    if (MODE->modeInfo)
+        data.modeInfo = *MODE->modeInfo;
+    else
+        data.calculateMode(connector);
+
+    return true;
 }
 
 bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
@@ -2517,6 +2907,8 @@ bool Aquamarine::CDRMOutput::setCursor(SP<IBuffer> buffer, const Vector2D& hotsp
         }
 
         cursorHotspot = hotspot;
+        if (cursorMailbox)
+            cursorMailbox->store(cursorPos);
 
         backend->backend->log(AQ_LOG_DEBUG, std::format("drm: Cursor buffer imported into KMS with id {}", fb->id));
 
@@ -2531,6 +2923,8 @@ bool Aquamarine::CDRMOutput::setCursor(SP<IBuffer> buffer, const Vector2D& hotsp
 
 void Aquamarine::CDRMOutput::moveCursor(const Vector2D& coord, bool skipSchedule) {
     cursorPos = coord;
+    if (cursorMailbox)
+        cursorMailbox->store(coord);
     // cursorVisible = true;
     // if (!skipSchedule)
     state->markCommitted(COutputState::AQ_OUTPUT_STATE_CURSOR_POS);
@@ -2633,6 +3027,142 @@ std::optional<std::chrono::steady_clock::time_point> Aquamarine::CDRMOutput::nex
     return std::nullopt;
 }
 
+uint32_t Aquamarine::CDRMOutput::commitCapabilities() const {
+    if (!backend || !backend->commitThread || !backend->atomic)
+        return 0;
+
+    uint32_t capabilities = AQ_OUTPUT_COMMIT_CAPABILITY_QUEUED | AQ_OUTPUT_COMMIT_CAPABILITY_TIMED;
+    if (connector->canDoVrr)
+        capabilities |= AQ_OUTPUT_COMMIT_CAPABILITY_VRR;
+    if (backend->drmProps.supportsAsyncCommit)
+        capabilities |= AQ_OUTPUT_COMMIT_CAPABILITY_TEARING;
+    if (connector->crtc && connector->crtc->cursor)
+        capabilities |= AQ_OUTPUT_COMMIT_CAPABILITY_LATE_CURSOR;
+    return capabilities;
+}
+
+Aquamarine::IOutput::SCommitSubmission Aquamarine::CDRMOutput::commitAsync(const SCommitOptions& options) {
+    const auto CAPABILITIES = commitCapabilities();
+    if (!(CAPABILITIES & AQ_OUTPUT_COMMIT_CAPABILITY_QUEUED))
+        return {.error = ENOTSUP};
+    if (options.targetPresentation && !(CAPABILITIES & AQ_OUTPUT_COMMIT_CAPABILITY_TIMED))
+        return {.error = ENOTSUP};
+    if (options.lateCursor && !(CAPABILITIES & AQ_OUTPUT_COMMIT_CAPABILITY_LATE_CURSOR))
+        return {.error = ENOTSUP};
+
+    if (!backend->sessionActive() || connector->status != DRM_MODE_CONNECTED || connector->output != self.lock() || !connector->crtc)
+        return {.error = ENODEV};
+
+    auto SNAPSHOT = state->snapshot();
+    if (SNAPSHOT.error())
+        return {.error = SNAPSHOT.error()};
+
+    const auto&        STATE     = SNAPSHOT.state();
+    const auto         COMMITTED = STATE.committed;
+    constexpr uint32_t ASYNC_PROPERTIES =
+        COutputState::AQ_OUTPUT_STATE_BUFFER | COutputState::AQ_OUTPUT_STATE_DAMAGE | COutputState::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE | COutputState::AQ_OUTPUT_STATE_CURSOR_POS;
+
+    if (!(COMMITTED & COutputState::AQ_OUTPUT_STATE_BUFFER) || (COMMITTED & ~ASYNC_PROPERTIES) || SNAPSHOT.needsReconfig() || lastCommitNoBuffer)
+        return {.error = ENOTSUP};
+    if (!STATE.buffer || !STATE.enabled || STATE.drmFormat == DRM_FORMAT_INVALID)
+        return {.error = EINVAL};
+    if (STATE.buffer->attachments.has<CDRMBufferUnimportable>())
+        return {.error = EINVAL};
+    if (STATE.adaptiveSync && !(CAPABILITIES & AQ_OUTPUT_COMMIT_CAPABILITY_VRR))
+        return {.error = ENOTSUP};
+    if (STATE.presentationMode == AQ_OUTPUT_PRESENTATION_IMMEDIATE && !(CAPABILITIES & AQ_OUTPUT_COMMIT_CAPABILITY_TEARING))
+        return {.error = ENOTSUP};
+    if (pendingAsyncCommit || connector->sched.frameInFlight())
+        return {.error = EBUSY};
+
+    SDRMConnectorCommitData        data;
+    Hyprutils::OS::CFileDescriptor mgpuFence;
+    bool                           mgpuAcquired = false, requiresSync = false;
+    CScopeGuard                    rollbackMgpu([this, &mgpuAcquired] {
+        if (mgpuAcquired && mgpu.swapchain)
+            mgpu.swapchain->rollback();
+    });
+    if (!prepareAsyncCommitData(SNAPSHOT, data, mgpuFence, mgpuAcquired, requiresSync))
+        return {.error = requiresSync ? ENOTSUP : EINVAL};
+
+    const auto MAIN_BUFFER = data.mainFB ? data.mainFB->buffer.lock() : nullptr;
+    const auto ATTRS       = MAIN_BUFFER ? MAIN_BUFFER->dmabuf() : SDMABUFAttrs{};
+    if (ATTRS.success && ATTRS.format != STATE.drmFormat)
+        return {.error = ENOTSUP};
+
+    if (options.lateCursor && cursorVisible && connector->crtc->cursor)
+        data.committed |= COutputState::AQ_OUTPUT_STATE_CURSOR_POS;
+
+    auto* atomicImpl = dynamic_cast<CDRMAtomicImpl*>(backend->impl.get());
+    if (!atomicImpl)
+        return {.error = ENOTSUP};
+
+    uint32_t atomicFlags   = 0;
+    auto     atomicRequest = atomicImpl->prepareAsync(connector, data, atomicFlags);
+    if (!atomicRequest)
+        return {.error = EINVAL};
+
+    auto asyncData           = makeUnique<CDRMAsyncCommitData>(std::move(SNAPSHOT));
+    asyncData->output        = self.lock();
+    asyncData->connector     = connector;
+    asyncData->commitData    = std::move(data);
+    asyncData->request       = std::move(atomicRequest);
+    asyncData->mainBuffer    = asyncData->commitData.mainFB ? asyncData->commitData.mainFB->buffer.lock() : nullptr;
+    asyncData->cursorBuffer  = asyncData->commitData.cursorFB ? asyncData->commitData.cursorFB->buffer.lock() : nullptr;
+    asyncData->flags         = atomicFlags;
+    asyncData->flipID        = backend->nextPageFlipID();
+    asyncData->tearing       = asyncData->commitData.flags & DRM_MODE_PAGE_FLIP_ASYNC;
+    asyncData->lateCursor    = options.lateCursor;
+    asyncData->mgpuFence     = std::move(mgpuFence);
+    asyncData->mgpuSwapchain = mgpuAcquired ? mgpu.swapchain : nullptr;
+    asyncData->mgpuAcquired  = std::exchange(mgpuAcquired, false);
+    asyncData->pinBuffers();
+
+    if (options.lateCursor && cursorVisible && connector->crtc->cursor) {
+        asyncData->cursorMailbox = cursorMailbox;
+        asyncData->cursorPlaneID = connector->crtc->cursor->id;
+        asyncData->cursorXProp   = connector->crtc->cursor->props.values.crtc_x;
+        asyncData->cursorYProp   = connector->crtc->cursor->props.values.crtc_y;
+        asyncData->cursorHotspot = cursorHotspot;
+    }
+
+    auto* asyncDataPtr          = asyncData.get();
+    auto  request               = makeUnique<SDRMCommitThreadRequest>();
+    request->ownerID            = asyncOwnerID;
+    request->queueKey           = connector->crtc->id;
+    request->targetPresentation = options.targetPresentation;
+    if (options.targetPresentation)
+        request->submitAt = *options.targetPresentation - backend->commitLeadTime;
+    request->data = std::move(asyncData);
+
+    const auto COMMIT_ID = backend->commitThread->enqueue(std::move(request));
+    if (!COMMIT_ID) {
+        auto* failedData = dynamic_cast<CDRMAsyncCommitData*>(request->data.get());
+        if (failedData) {
+            atomicImpl->finalizeAsync(*failedData->request, connector, failedData->commitData, false);
+            failedData->rollbackMgpu();
+            failedData->releasePins();
+        }
+        return {.error = ECANCELED};
+    }
+    const bool TEARING = asyncDataPtr->commitData.flags & DRM_MODE_PAGE_FLIP_ASYNC;
+    connector->crtc->armPageFlip(connector, TEARING, asyncDataPtr->flipID, *COMMIT_ID, false);
+    pendingAsyncCommit = *COMMIT_ID;
+    connector->sched.onFrameSubmitted();
+    state->consume(*asyncDataPtr->snapshot);
+    lastCommitNoBuffer = false;
+    needsFrame         = false;
+
+    asyncCommitEventPending = true;
+    ++backend->m_pendingAsyncCommitEvents;
+    backend->backend->addIdleEvent(makeShared<std::function<void(void)>>([output = self, drmBackend = backend] {
+        if (const auto OUTPUT = output.lock(); OUTPUT && drmBackend)
+            drmBackend->emitAsyncCommitEvent(OUTPUT);
+    }));
+
+    return {.id = *COMMIT_ID};
+}
+
 size_t Aquamarine::CDRMOutput::getGammaSize() {
     if (!backend->atomic) {
         backend->log(AQ_LOG_ERROR, "No support for gamma on the legacy iface");
@@ -2695,7 +3225,10 @@ int Aquamarine::CDRMOutput::getConnectorID() {
 
 Aquamarine::CDRMOutput::CDRMOutput(const std::string& name_, Hyprutils::Memory::CWeakPointer<CDRMBackend> backend_, SP<SDRMConnector> connector_) :
     backend(backend_), connector(connector_) {
-    name = name_;
+    name          = name_;
+    asyncOwnerID  = backend->nextAsyncOwnerID();
+    cursorMailbox = makeAtomicShared<CDRMCursorPositionMailbox>();
+    cursorMailbox->store(cursorPos);
 
     // The scheduler's frameReady signal drives the public events.frame on this output.
     frameReadyListener = connector->sched.frameReady.listen([this]() { events.frame.emit(); });

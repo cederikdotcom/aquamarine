@@ -131,6 +131,26 @@ void Aquamarine::COutputState::consume(const CSnapshot& snapshot) {
     }
 }
 
+void Aquamarine::COutputState::rearm(const CSnapshot& snapshot) {
+    ASSERT(snapshot.m_owner == this);
+    if (snapshot.m_owner != this)
+        return;
+
+    uint32_t properties = snapshot.m_state.committed & ~(AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE | AQ_OUTPUT_STATE_EXPLICIT_OUT_FENCE);
+    while (properties) {
+        const uint32_t property = 1U << std::countr_zero(properties);
+        const size_t   index    = std::countr_zero(property);
+        properties &= ~property;
+
+        if (propertyGenerations.at(index) != snapshot.m_generations.at(index))
+            continue;
+
+        internalState.committed |= property;
+        if (property == AQ_OUTPUT_STATE_DAMAGE)
+            internalState.damage.add(snapshot.m_state.damage);
+    }
+}
+
 bool Aquamarine::COutputState::needsReconfig() const {
     return internalState.committed & (AQ_OUTPUT_STATE_ENABLED | AQ_OUTPUT_STATE_FORMAT | AQ_OUTPUT_STATE_MODE | AQ_OUTPUT_STATE_HDR | AQ_OUTPUT_STATE_WCG);
 }

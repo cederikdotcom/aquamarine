@@ -1,4 +1,5 @@
 #include <aquamarine/backend/drm/Atomic.hpp>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <drm_mode.h>
@@ -145,6 +146,24 @@ void Aquamarine::CDRMAtomicRequest::add(uint32_t id, uint32_t prop, uint64_t val
         backend->log(AQ_LOG_ERROR, "atomic drm request: failed to add prop");
         failed = true;
     }
+}
+
+bool Aquamarine::CDRMAtomicRequest::addRaw(uint32_t id, uint32_t prop, uint64_t val) noexcept {
+    if (!req || !id || !prop)
+        return false;
+
+    return drmModeAtomicAddProperty(req, id, prop, val) >= 0;
+}
+
+CDRMAtomicRequest::SAsyncResult Aquamarine::CDRMAtomicRequest::submitAsync(int drmFD, uint32_t flags, uint64_t commitID) noexcept {
+    if (!req || failed || drmFD < 0 || !commitID)
+        return {.submitted = false, .error = EINVAL};
+
+    const auto RET = drmModeAtomicCommit(drmFD, req, flags, rc<void*>(commitID));
+    if (RET)
+        return {.submitted = false, .error = RET == -1 ? errno : -RET};
+
+    return {.submitted = true, .error = 0};
 }
 
 void Aquamarine::CDRMAtomicRequest::planeProps(Hyprutils::Memory::CSharedPointer<SDRMPlane> plane, Hyprutils::Memory::CSharedPointer<CDRMFB> fb, uint32_t crtc,
@@ -445,6 +464,41 @@ void Aquamarine::CDRMAtomicRequest::apply(SDRMConnectorCommitData& data) {
 
 Aquamarine::CDRMAtomicImpl::CDRMAtomicImpl(Hyprutils::Memory::CSharedPointer<CDRMBackend> backend_) : backend(backend_) {
     ;
+}
+
+CUniquePointer<CDRMAtomicRequest> Aquamarine::CDRMAtomicImpl::prepareAsync(SP<SDRMConnector> connector, SDRMConnectorCommitData& data, uint32_t& flags) {
+    if (!prepareConnector(connector, data))
+        return nullptr;
+
+    auto request = makeUnique<CDRMAtomicRequest>(backend);
+    request->addConnector(connector, data);
+
+    flags = data.flags | DRM_MODE_ATOMIC_NONBLOCK;
+    if (request->failed) {
+        request->rollback(data);
+        return nullptr;
+    }
+
+    return request;
+}
+
+void Aquamarine::CDRMAtomicImpl::finalizeAsync(CDRMAtomicRequest& request, SP<SDRMConnector> connector, SDRMConnectorCommitData& data, bool success) {
+    if (!success) {
+        request.rollback(data);
+        return;
+    }
+
+    request.apply(data);
+    connector->atomic.maxBpc      = data.atomic.maxBpc;
+    connector->atomic.colorspace  = data.atomic.colorspace;
+    connector->atomic.contentType = data.atomic.contentType;
+    connector->atomic.crtcID      = data.atomic.crtcID;
+    connector->atomic.propsCached = true;
+    connector->atomic.colorRange  = data.outputState.colorRange;
+    connector->atomic.vrrEnabled  = data.outputState.adaptiveSync;
+    connector->output->vrrActive  = data.outputState.adaptiveSync;
+    if (data.atomic.ctmd)
+        connector->crtc->atomic.ctmStateKnown = true;
 }
 
 bool Aquamarine::CDRMAtomicImpl::prepareConnector(Hyprutils::Memory::CSharedPointer<SDRMConnector> connector, SDRMConnectorCommitData& data) {

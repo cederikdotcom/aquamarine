@@ -73,8 +73,10 @@ namespace Aquamarine {
 
         ~CDRMCommitThread();
 
-        std::optional<uint64_t> enqueue(Hyprutils::Memory::CUniquePointer<SDRMCommitThreadRequest> request);
+        std::optional<uint64_t> enqueue(Hyprutils::Memory::CUniquePointer<SDRMCommitThreadRequest>&& request);
         size_t                  cancelOwner(uint64_t ownerID);
+        bool                    pauseQueue(uint64_t queueKey);
+        bool                    resumeQueue(uint64_t queueKey);
         bool                    releaseQueue(uint64_t queueKey, uint64_t commitID);
         std::vector<SResult>    stopAndDrain();
 
@@ -119,7 +121,8 @@ namespace Aquamarine {
         std::condition_variable                                                 m_queueCondition;
         std::vector<SQueuedRequest>                                             m_queue;
         std::unordered_map<uint64_t, SBlocker>                                  m_blockedQueues;
-        std::unordered_set<uint64_t>                                            m_pausedQueues;
+        std::unordered_map<uint64_t, size_t>                                    m_pausedQueues;
+        std::unordered_set<uint64_t>                                            m_cancellingQueues;
         std::unordered_set<uint64_t>                                            m_cancelledOwners;
         std::optional<SActiveRequest>                                           m_activeRequest;
         uint64_t                                                                m_lastCommitID = 0;

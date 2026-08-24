@@ -105,6 +105,23 @@ int main() {
     EXPECT(outputState.state().committed, 0U);
     EXPECT(outputState.state().damage.empty(), true);
 
+    COutputState retryState;
+    retryState.setFormat(DRM_FORMAT_XRGB8888);
+    retryState.addDamage(Hyprutils::Math::CRegion{0, 0, 20, 20});
+    const auto RETRY_SNAPSHOT = retryState.snapshot();
+    retryState.consume(RETRY_SNAPSHOT);
+    EXPECT(retryState.state().committed, 0U);
+    retryState.rearm(RETRY_SNAPSHOT);
+    EXPECT(!!(retryState.state().committed & COutputState::AQ_OUTPUT_STATE_FORMAT), true);
+    EXPECT(!!(retryState.state().committed & COutputState::AQ_OUTPUT_STATE_DAMAGE), true);
+    EXPECT(retryState.state().damage.empty(), false);
+
+    const auto STALE_RETRY_SNAPSHOT = retryState.snapshot();
+    retryState.consume(STALE_RETRY_SNAPSHOT);
+    retryState.setFormat(DRM_FORMAT_ARGB8888);
+    retryState.rearm(STALE_RETRY_SNAPSHOT);
+    EXPECT(retryState.state().drmFormat, DRM_FORMAT_ARGB8888);
+
     outputState.setFormat(DRM_FORMAT_XRGB8888);
     outputState.setAdaptiveSync(true);
     const auto PARTIAL_SNAPSHOT = outputState.snapshot();

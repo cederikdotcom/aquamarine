@@ -115,6 +115,7 @@ namespace Aquamarine {
         const SInternalState& state() const;
         CSnapshot             snapshot() const;
         void                  consume(const CSnapshot& snapshot);
+        void                  rearm(const CSnapshot& snapshot);
 
         bool                  needsReconfig() const;
         void                  addDamage(const Hyprutils::Math::CRegion& region);
@@ -147,6 +148,7 @@ namespace Aquamarine {
         friend class IOutput;
         friend class CWaylandOutput;
         friend class CDRMOutput;
+        friend class CDRMBackend;
         friend class CHeadlessOutput;
         friend struct SDRMConnector;
     };

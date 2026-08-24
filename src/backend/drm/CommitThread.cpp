@@ -50,7 +50,7 @@ Aquamarine::CDRMCommitThread::~CDRMCommitThread() {
     stop();
 }
 
-std::optional<uint64_t> Aquamarine::CDRMCommitThread::enqueue(CUniquePointer<SDRMCommitThreadRequest> request) {
+std::optional<uint64_t> Aquamarine::CDRMCommitThread::enqueue(CUniquePointer<SDRMCommitThreadRequest>&& request) {
     if (!request || !request->data || request->id != 0 || request->ownerID == 0 || request->queueKey == 0)
         return std::nullopt;
 
@@ -113,12 +113,39 @@ size_t Aquamarine::CDRMCommitThread::cancelOwner(uint64_t ownerID) {
         std::lock_guard<std::mutex> lock(m_queueMutex);
         std::erase_if(m_blockedQueues, [ownerID](const auto& entry) { return entry.second.ownerID == ownerID; });
         for (const auto QUEUE : cancelledQueues)
-            m_pausedQueues.erase(QUEUE);
+            m_cancellingQueues.erase(QUEUE);
     }
 
     m_queueCondition.notify_one();
 
     return requests.size();
+}
+
+bool Aquamarine::CDRMCommitThread::pauseQueue(uint64_t queueKey) {
+    if (queueKey == 0)
+        return false;
+
+    std::unique_lock<std::mutex> lock(m_queueMutex);
+    ++m_pausedQueues[queueKey];
+    m_queueCondition.wait(lock, [this, queueKey] { return !m_activeRequest || m_activeRequest->queueKey != queueKey; });
+    return true;
+}
+
+bool Aquamarine::CDRMCommitThread::resumeQueue(uint64_t queueKey) {
+    if (queueKey == 0)
+        return false;
+
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        const auto                  PAUSE = m_pausedQueues.find(queueKey);
+        if (PAUSE == m_pausedQueues.end())
+            return false;
+        if (--PAUSE->second == 0)
+            m_pausedQueues.erase(PAUSE);
+    }
+
+    m_queueCondition.notify_one();
+    return true;
 }
 
 bool Aquamarine::CDRMCommitThread::releaseQueue(uint64_t queueKey, uint64_t commitID) {
@@ -278,7 +305,8 @@ CUniquePointer<SDRMCommitThreadRequest> Aquamarine::CDRMCommitThread::takeNextRe
             const auto& QUEUED = m_queue.at(i);
             const auto  KEY    = QUEUED.request->queueKey;
 
-            if (!seenQueues.emplace(KEY).second || m_blockedQueues.contains(KEY) || m_pausedQueues.contains(KEY) || m_cancelledOwners.contains(QUEUED.request->ownerID))
+            if (!seenQueues.emplace(KEY).second || m_blockedQueues.contains(KEY) || m_pausedQueues.contains(KEY) || m_cancellingQueues.contains(KEY) ||
+                m_cancelledOwners.contains(QUEUED.request->ownerID))
                 continue;
 
             const auto SUBMIT_AT = QUEUED.request->submitAt.value_or(std::chrono::steady_clock::time_point::min());
@@ -345,7 +373,7 @@ std::vector<CUniquePointer<SDRMCommitThreadRequest>> Aquamarine::CDRMCommitThrea
                 continue;
             }
 
-            m_pausedQueues.emplace(it->request->queueKey);
+            m_cancellingQueues.emplace(it->request->queueKey);
             requests.emplace_back(std::move(it->request));
             it = m_queue.erase(it);
         }
