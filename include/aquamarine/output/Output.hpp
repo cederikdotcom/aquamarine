@@ -127,6 +127,43 @@ namespace Aquamarine {
       public:
         virtual ~IOutput();
 
+        enum eOutputCommitCapabilities : uint32_t {
+            AQ_OUTPUT_COMMIT_CAPABILITY_QUEUED      = (1 << 0), // Supports commitAsync.
+            AQ_OUTPUT_COMMIT_CAPABILITY_TIMED       = (1 << 1), // Supports targetPresentation.
+            AQ_OUTPUT_COMMIT_CAPABILITY_VRR         = (1 << 2), // Supports queued commits while adaptive sync is active.
+            AQ_OUTPUT_COMMIT_CAPABILITY_TEARING     = (1 << 3), // Supports queued immediate-presentation commits.
+            AQ_OUTPUT_COMMIT_CAPABILITY_LATE_CURSOR = (1 << 4), // Supports lateCursor.
+        };
+
+        enum eOutputCommitStatus : uint32_t {
+            AQ_OUTPUT_COMMIT_SUBMITTED = 0,
+            AQ_OUTPUT_COMMIT_FAILED,
+            AQ_OUTPUT_COMMIT_CANCELLED,
+        };
+
+        // commitAsync snapshots pending state before returning. Requesting an option without its corresponding capability is rejected with ENOTSUP.
+        struct SCommitOptions {
+            // requires TIMED when set. The value is the desired presentation time; nullopt requests immediate submission.
+            std::optional<std::chrono::steady_clock::time_point> targetPresentation;
+            // requires LATE_CURSOR when set. The cursor position is the only state allowed to change after commitAsync returns.
+            bool lateCursor = false;
+        };
+
+        // rejection leaves pending output state untouched. Pending VRR or tearing state requires the corresponding capability.
+        struct SCommitSubmission {
+            uint64_t id    = 0; // 0 means rejected.
+            int      error = 0; // Positive errno, 0 on acceptance.
+        };
+
+        // every accepted id receives exactly one result after commitAsync returns, on the backend's dispatch thread. A submitted result precedes its presentation.
+        // cancellation results are emitted before destroy.
+        struct SCommitResult {
+            uint64_t            id           = 0;
+            eOutputCommitStatus status       = AQ_OUTPUT_COMMIT_FAILED;
+            int                 error        = 0;     // positive errno, 0 when submitted.
+            bool                missedTarget = false; // backend submission completed after targetPresentation. Valid only for timed, submitted commits.
+        };
+
         enum scheduleFrameReason : uint32_t {
             AQ_SCHEDULE_UNKNOWN = 0,
             AQ_SCHEDULE_NEW_CONNECTOR,
@@ -177,7 +214,7 @@ namespace Aquamarine {
         virtual void                                                      moveCursor(const Hyprutils::Math::Vector2D& coord, bool skipSchedule = false); // includes the hotspot
         virtual void                                                      setCursorVisible(bool visible); // moving the cursor will make it visible again without this util
         virtual bool                                                      hasCursorPlane() const;
-        virtual Hyprutils::Math::Vector2D                                 cursorPlaneSize();              // -1, -1 means no set size, 0, 0 means error
+        virtual Hyprutils::Math::Vector2D                                 cursorPlaneSize(); // -1, -1 means no set size, 0, 0 means error
         virtual std::optional<std::chrono::steady_clock::time_point>      nextVBlank() const;
         virtual void                                                      scheduleFrame(const scheduleFrameReason reason = AQ_SCHEDULE_UNKNOWN);
         virtual size_t                                                    getGammaSize();
@@ -185,6 +222,8 @@ namespace Aquamarine {
         virtual bool                                                      destroy(); // not all backends allow this!!!
         virtual bool                                                      pendingPageFlip()  = 0;
         virtual bool                                                      pendingIdleFrame() = 0;
+        virtual uint32_t                                                  commitCapabilities() const;
+        virtual SCommitSubmission                                         commitAsync(const SCommitOptions& options);
 
         std::string                                                       name, description, make, model, serial;
         SParsedEDID                                                       parsedEDID;
@@ -220,6 +259,7 @@ namespace Aquamarine {
             unsigned int seq       = 0;
             int          refresh   = 0;
             uint32_t     flags     = 0;
+            uint64_t     commitID  = 0; // 0 means the presentation is not associated with a queued commit.
         };
 
         struct {
@@ -229,6 +269,7 @@ namespace Aquamarine {
             Hyprutils::Signal::CSignalT<SPresentEvent> present;
             Hyprutils::Signal::CSignalT<>              commit;
             Hyprutils::Signal::CSignalT<SStateEvent>   state;
+            Hyprutils::Signal::CSignalT<SCommitResult> commitResult;
         } events;
     };
 }

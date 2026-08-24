@@ -1,6 +1,7 @@
 #include <aquamarine/output/Output.hpp>
 #include <aquamarine/backend/Backend.hpp>
 #include <hyprutils/memory/SharedPtr.hpp>
+#include <cerrno>
 #include "OutputTiming.hpp"
 #include "shared.hpp"
 
@@ -40,6 +41,46 @@ int main() {
 
     EXPECT(output.hasCursorPlane(), false);
     EXPECT(output.nextVBlank().has_value(), false);
+    EXPECT(output.commitCapabilities(), 0U);
+
+    const IOutput::SCommitOptions DEFAULT_OPTIONS;
+    EXPECT(DEFAULT_OPTIONS.targetPresentation.has_value(), false);
+    EXPECT(DEFAULT_OPTIONS.lateCursor, false);
+
+    bool                         resultFired        = false;
+    uint64_t                     resultID           = 0;
+    IOutput::eOutputCommitStatus resultStatus       = IOutput::AQ_OUTPUT_COMMIT_FAILED;
+    int                          resultError        = 0;
+    bool                         resultMissedTarget = false;
+    auto                         resultListener     = output.events.commitResult.listen([&](const IOutput::SCommitResult& event) {
+        resultFired        = true;
+        resultID           = event.id;
+        resultStatus       = event.status;
+        resultError        = event.error;
+        resultMissedTarget = event.missedTarget;
+    });
+
+    const auto                   SUBMISSION = output.commitAsync({});
+    EXPECT(SUBMISSION.id, 0U);
+    EXPECT(SUBMISSION.error, ENOTSUP);
+    EXPECT(resultFired, false);
+
+    output.events.commitResult.emit({
+        .id           = 42,
+        .status       = IOutput::AQ_OUTPUT_COMMIT_SUBMITTED,
+        .missedTarget = true,
+    });
+
+    EXPECT(resultFired, true);
+    EXPECT(resultID, 42U);
+    EXPECT(resultStatus, IOutput::AQ_OUTPUT_COMMIT_SUBMITTED);
+    EXPECT(resultError, 0);
+    EXPECT(resultMissedTarget, true);
+
+    const IOutput::SPresentEvent PRESENT_EVENT{
+        .commitID = 42,
+    };
+    EXPECT(PRESENT_EVENT.commitID, 42U);
 
     using namespace std::chrono_literals;
 

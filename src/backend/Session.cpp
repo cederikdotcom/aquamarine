@@ -234,8 +234,8 @@ void Aquamarine::CSessionDevice::resolveMatchingRenderNode(udev_device* cardDevi
     // for non-standard buses, reverted by 8ed71bb), commit 2455556b
     // (last known-good on M-series Asahi per the #260 thread).
     if (renderNodeFd < 0) {
-        int renderDCount = 0;
-        udev_list_entry* countEntry = nullptr;
+        int              renderDCount = 0;
+        udev_list_entry* countEntry   = nullptr;
         udev_list_entry_foreach(countEntry, devices) {
             const auto* path = udev_list_entry_get_name(countEntry);
             auto        dev  = udev_device_new_from_syspath(session->udevHandle, path);
@@ -263,9 +263,9 @@ void Aquamarine::CSessionDevice::resolveMatchingRenderNode(udev_device* cardDevi
                 }
                 renderNodeFd = open(fbDevnode, O_RDWR | O_CLOEXEC);
                 if (renderNodeFd >= 0) {
-                    session->backend->log(AQ_LOG_WARNING,
-                        std::format("drm: No matching render node for {}, falling back to sole renderD on the system: {}",
-                            parentSyspath ? parentSyspath : "(unknown)", fbDevnode));
+                    session->backend->log(
+                        AQ_LOG_WARNING,
+                        std::format("drm: No matching render node for {}, falling back to sole renderD on the system: {}", parentSyspath ? parentSyspath : "(unknown)", fbDevnode));
                     udev_device_unref(fbDev);
                     break;
                 }
@@ -273,8 +273,9 @@ void Aquamarine::CSessionDevice::resolveMatchingRenderNode(udev_device* cardDevi
             }
         } else if (renderDCount > 1) {
             session->backend->log(AQ_LOG_WARNING,
-                std::format("drm: No matching render node for {}, refusing to guess among {} renderD candidates; leaving renderer to fall through to KMS fd (may force software rendering; set AQ_DRM_DEVICES to disambiguate)",
-                    parentSyspath ? parentSyspath : "(unknown)", renderDCount));
+                                  std::format("drm: No matching render node for {}, refusing to guess among {} renderD candidates; leaving renderer to fall through to KMS fd (may "
+                                              "force software rendering; set AQ_DRM_DEVICES to disambiguate)",
+                                              parentSyspath ? parentSyspath : "(unknown)", renderDCount));
         }
     }
 

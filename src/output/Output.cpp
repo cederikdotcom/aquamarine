@@ -1,5 +1,7 @@
 #include <aquamarine/output/Output.hpp>
 
+#include <cerrno>
+
 using namespace Aquamarine;
 
 Aquamarine::IOutput::~IOutput() {
@@ -13,6 +15,16 @@ Hyprutils::Memory::CSharedPointer<SOutputMode> Aquamarine::IOutput::preferredMod
     }
 
     return nullptr;
+}
+
+uint32_t Aquamarine::IOutput::commitCapabilities() const {
+    return 0;
+}
+
+Aquamarine::IOutput::SCommitSubmission Aquamarine::IOutput::commitAsync(const SCommitOptions& options) {
+    return {
+        .error = ENOTSUP,
+    };
 }
 
 void Aquamarine::IOutput::moveCursor(const Hyprutils::Math::Vector2D& coord, bool skipSchedule) {
