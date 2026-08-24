@@ -221,7 +221,9 @@ namespace Aquamarine {
         virtual void                                                      moveCursor(const Hyprutils::Math::Vector2D& coord, bool skipSchedule = false);
         virtual void                                                      scheduleFrame(const scheduleFrameReason reason = AQ_SCHEDULE_UNKNOWN);
         virtual void                                                      setCursorVisible(bool visible);
+        virtual bool                                                      hasCursorPlane() const;
         virtual Hyprutils::Math::Vector2D                                 cursorPlaneSize();
+        virtual std::optional<std::chrono::steady_clock::time_point>      nextVBlank() const;
         virtual size_t                                                    getGammaSize();
         virtual size_t                                                    getDeGammaSize();
         virtual std::vector<SDRMFormat>                                   getRenderFormats();

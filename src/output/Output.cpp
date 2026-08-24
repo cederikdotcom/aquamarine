@@ -27,12 +27,20 @@ void Aquamarine::IOutput::setCursorVisible(bool visible) {
     ;
 }
 
+bool Aquamarine::IOutput::hasCursorPlane() const {
+    return false;
+}
+
 void Aquamarine::IOutput::scheduleFrame(const scheduleFrameReason reason) {
     ;
 }
 
 Hyprutils::Math::Vector2D Aquamarine::IOutput::cursorPlaneSize() {
     return {}; // error
+}
+
+std::optional<std::chrono::steady_clock::time_point> Aquamarine::IOutput::nextVBlank() const {
+    return std::nullopt;
 }
 
 size_t Aquamarine::IOutput::getGammaSize() {

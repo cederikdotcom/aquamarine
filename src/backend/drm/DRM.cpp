@@ -35,6 +35,7 @@ extern "C" {
 #include "Shared.hpp"
 #include "hwdata.hpp"
 #include "Renderer.hpp"
+#include "OutputTiming.hpp"
 
 #include <hyprutils/utils/ScopeGuard.hpp>
 using Hyprutils::Utils::CScopeGuard;
@@ -2486,6 +2487,54 @@ void Aquamarine::CDRMOutput::scheduleFrame(const scheduleFrameReason reason) {
 
 Vector2D Aquamarine::CDRMOutput::cursorPlaneSize() {
     return backend->drmProps.cursorSize;
+}
+
+bool Aquamarine::CDRMOutput::hasCursorPlane() const {
+    return connector->status == DRM_MODE_CONNECTED && connector->crtc && connector->crtc->cursor && !connector->crtc->cursor->formats.empty();
+}
+
+std::optional<std::chrono::steady_clock::time_point> Aquamarine::CDRMOutput::nextVBlank() const {
+    const auto BACKEND = backend.lock();
+    if (!BACKEND || !BACKEND->sessionActive() || connector->status != DRM_MODE_CONNECTED || !connector->crtc || !enabledState || connector->refresh <= 0 ||
+        (lease && lease->active))
+        return std::nullopt;
+
+    const auto& STATE = state->state();
+
+    if (state->needsReconfig() || (STATE.committed & (COutputState::AQ_OUTPUT_STATE_ADAPTIVE_SYNC | COutputState::AQ_OUTPUT_STATE_PRESENTATION_MODE)) || !STATE.enabled ||
+        STATE.adaptiveSync || STATE.presentationMode != AQ_OUTPUT_PRESENTATION_VSYNC)
+        return std::nullopt;
+
+    const auto REFRESH_PERIOD = std::chrono::nanoseconds{1'000'000'000'000LL / connector->refresh};
+
+    for (size_t attempt = 0; attempt < 2; ++attempt) {
+        uint64_t sequence = 0, lastVblankNs = 0;
+        if (drmCrtcGetSequence(BACKEND->drmFD(), connector->crtc->id, &sequence, &lastVblankNs))
+            return std::nullopt;
+
+        if (BACKEND->gpuDriver() == AQ_BACKEND_GPU_DRIVER_NVIDIA && sequence == 0)
+            return std::nullopt;
+
+        const auto STEADY_BEFORE = std::chrono::steady_clock::now();
+        timespec   monotonicNow  = {};
+        if (clock_gettime(CLOCK_MONOTONIC, &monotonicNow))
+            return std::nullopt;
+        const auto STEADY_AFTER = std::chrono::steady_clock::now();
+
+        if (lastVblankNs > sc<uint64_t>(std::chrono::nanoseconds::max().count()))
+            return std::nullopt;
+
+        const auto MONOTONIC_NOW = std::chrono::seconds{monotonicNow.tv_sec} + std::chrono::nanoseconds{monotonicNow.tv_nsec};
+        const auto NEXT          = OutputTiming::predictNextVBlank(std::chrono::nanoseconds{lastVblankNs}, MONOTONIC_NOW, REFRESH_PERIOD);
+        if (!NEXT)
+            continue;
+
+        const auto RESULT = OutputTiming::toSteadyClock(*NEXT, MONOTONIC_NOW, STEADY_BEFORE, STEADY_AFTER);
+        if (RESULT)
+            return RESULT;
+    }
+
+    return std::nullopt;
 }
 
 size_t Aquamarine::CDRMOutput::getGammaSize() {

@@ -149,6 +149,15 @@ add_test(
   COMMAND attachments "attachments")
 add_dependencies(tests attachments)
 
+add_executable(output "tests/Output.cpp")
+target_include_directories(output PRIVATE "./src/include")
+target_link_libraries(output PRIVATE PkgConfig::deps aquamarine)
+add_test(
+  NAME "output"
+  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/tests
+  COMMAND output "output")
+add_dependencies(tests output)
+
 # Installation
 install(TARGETS aquamarine)
 install(DIRECTORY "include/aquamarine" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <vector>
 #include <optional>
 #include <hyprutils/signal/Signal.hpp>
@@ -175,7 +176,9 @@ namespace Aquamarine {
         virtual bool                                                      setCursor(Hyprutils::Memory::CSharedPointer<IBuffer> buffer, const Hyprutils::Math::Vector2D& hotspot);
         virtual void                                                      moveCursor(const Hyprutils::Math::Vector2D& coord, bool skipSchedule = false); // includes the hotspot
         virtual void                                                      setCursorVisible(bool visible); // moving the cursor will make it visible again without this util
+        virtual bool                                                      hasCursorPlane() const;
         virtual Hyprutils::Math::Vector2D                                 cursorPlaneSize();              // -1, -1 means no set size, 0, 0 means error
+        virtual std::optional<std::chrono::steady_clock::time_point>      nextVBlank() const;
         virtual void                                                      scheduleFrame(const scheduleFrameReason reason = AQ_SCHEDULE_UNKNOWN);
         virtual size_t                                                    getGammaSize();
         virtual size_t                                                    getDeGammaSize();
