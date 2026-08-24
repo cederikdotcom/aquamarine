@@ -18,6 +18,8 @@ namespace Aquamarine {
     class CDRMRenderer;
     class CDRMDumbAllocator;
 
+    using DRMFBList = std::vector<Hyprutils::Memory::CSharedPointer<CDRMFB>>;
+
     typedef std::function<void(void)> FIdleCallback;
 
     class CDRMBufferAttachment : public IAttachment {
@@ -116,6 +118,7 @@ namespace Aquamarine {
         Hyprutils::Memory::CSharedPointer<CDRMFB>    front /* currently displaying */, back /* submitted */, last /* keep just in case */;
         Hyprutils::Memory::CWeakPointer<CDRMBackend> backend;
         Hyprutils::Memory::CWeakPointer<SDRMPlane>   self;
+        bool                                         backSet = false;
         std::vector<SDRMFormat>                      formats;
 
         union UDRMPlaneProps {
@@ -265,12 +268,17 @@ namespace Aquamarine {
 
     struct SDRMConnectorCommitData {
         Hyprutils::Memory::CSharedPointer<CDRMFB> mainFB, cursorFB;
-        bool                                      modeset   = false;
-        bool                                      blocking  = false;
-        uint32_t                                  flags     = 0;
-        bool                                      test      = false;
-        bool                                      enabled   = false;
-        uint32_t                                  committed = 0;
+        COutputState::SInternalState              outputState;
+        Hyprutils::Math::Vector2D                 cursorPos, cursorHotspot;
+        bool                                      cursorVisible    = false;
+        bool                                      modeset          = false;
+        bool                                      blocking         = false;
+        uint32_t                                  flags            = 0;
+        bool                                      test             = false;
+        bool                                      enabled          = false;
+        uint32_t                                  committed        = 0;
+        bool                                      primaryFBChanged = false, cursorFBChanged = false;
+        DRMFBList                                 retiredFBs;
         Hyprutils::Math::CRegion                  damage;
         drmModeModeInfo                           modeInfo;
         std::optional<Hyprutils::Math::Mat3x3>    ctm;
@@ -327,12 +335,12 @@ namespace Aquamarine {
         drmModeModeInfo*                               getCurrentMode();
         IOutput::SParsedEDID                           parseEDID(std::vector<uint8_t> data);
         bool                                           commitState(SDRMConnectorCommitData& data);
-        void                                           applyCommit(const SDRMConnectorCommitData& data);
-        void                                           onPresent();
+        void                                           applyCommit(SDRMConnectorCommitData& data);
+        void                                           onPresent(bool primary = true, bool cursor = true, DRMFBList* retired = nullptr);
         void                                           recheckCRTCProps();
         void                                           parseTileInfo();
         void                                           releaseFBBuffer(const Hyprutils::Memory::CSharedPointer<CDRMFB> fb);
-        void                                           releaseFBReferences();
+        void                                           releaseFBReferences(DRMFBList* retired = nullptr);
         void                                           invalidateFrame();
         void                                           setCRTC(Hyprutils::Memory::CSharedPointer<SDRMCRTC> newCRTC);
 
@@ -372,11 +380,12 @@ namespace Aquamarine {
 
             // last connector_state values successfully committed to the kernel. used
             // to skip re-emitting unchanged values on page-flips (see #265).
-            uint64_t maxBpc      = 0;
-            uint64_t colorspace  = 0;
-            uint16_t contentType = 0;
-            uint32_t crtcID      = 0;
-            bool     propsCached = false;
+            uint64_t          maxBpc      = 0;
+            uint64_t          colorspace  = 0;
+            uint16_t          contentType = 0;
+            uint32_t          crtcID      = 0;
+            bool              propsCached = false;
+            eOutputColorRange colorRange  = AQ_OUTPUT_COLOR_RANGE_AUTO;
         } atomic;
 
         union UDRMConnectorProps {
@@ -466,7 +475,7 @@ namespace Aquamarine {
         bool checkFeatures();
         bool initResources();
         bool initMgpu();
-        bool updateSecondaryRendererState();
+        bool updateSecondaryRendererState(DRMFBList* retired = nullptr);
         bool grabFormats();
         bool shouldBlit();
         void scanConnectors();

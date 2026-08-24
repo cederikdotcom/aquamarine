@@ -30,7 +30,8 @@ namespace Aquamarine {
         void addConnectorCursor(Hyprutils::Memory::CSharedPointer<SDRMConnector> connector, SDRMConnectorCommitData& data);
         bool commit(uint32_t flagssss);
         void add(uint32_t id, uint32_t prop, uint64_t val);
-        void planeProps(Hyprutils::Memory::CSharedPointer<SDRMPlane> plane, Hyprutils::Memory::CSharedPointer<CDRMFB> fb, uint32_t crtc, Hyprutils::Math::Vector2D pos);
+        void planeProps(Hyprutils::Memory::CSharedPointer<SDRMPlane> plane, Hyprutils::Memory::CSharedPointer<CDRMFB> fb, uint32_t crtc, Hyprutils::Math::Vector2D pos,
+                        eOutputColorRange colorRange = AQ_OUTPUT_COLOR_RANGE_AUTO);
         void planePropsPos(Hyprutils::Memory::CSharedPointer<SDRMPlane> plane, Hyprutils::Math::Vector2D pos);
 
         void rollback(SDRMConnectorCommitData& data);

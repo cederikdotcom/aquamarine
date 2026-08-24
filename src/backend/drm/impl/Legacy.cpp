@@ -25,7 +25,7 @@ bool Aquamarine::CDRMLegacyImpl::moveCursor(Hyprutils::Memory::CSharedPointer<SD
 }
 
 bool Aquamarine::CDRMLegacyImpl::commitInternal(Hyprutils::Memory::CSharedPointer<SDRMConnector> connector, SDRMConnectorCommitData& data) {
-    const auto& STATE = connector->output->state->state();
+    const auto& STATE = data.outputState;
     SP<CDRMFB>  mainFB;
     bool        enable = data.enabled;
 
@@ -86,7 +86,7 @@ bool Aquamarine::CDRMLegacyImpl::commitInternal(Hyprutils::Memory::CSharedPointe
 
     // TODO: gamma
 
-    if (data.cursorFB && connector->crtc->cursor && connector->output->cursorVisible && enable &&
+    if (data.cursorFB && connector->crtc->cursor && data.cursorVisible && enable &&
         (data.committed & COutputState::AQ_OUTPUT_STATE_CURSOR_SHAPE || data.committed & COutputState::AQ_OUTPUT_STATE_CURSOR_POS)) {
         uint32_t boHandle = 0;
         auto     attrs    = data.cursorFB->buffer->dmabuf();
@@ -100,18 +100,16 @@ bool Aquamarine::CDRMLegacyImpl::commitInternal(Hyprutils::Memory::CSharedPointe
                                          std::format("legacy drm: cursor fb: {} with bo handle {} from fd {}, size {}", connector->backend->gpu->fd, boHandle,
                                                      data.cursorFB->buffer->dmabuf().fds.at(0), data.cursorFB->buffer->size));
 
-        Vector2D                cursorPos = connector->output->cursorPos;
-
         struct drm_mode_cursor2 request = {
             .flags   = DRM_MODE_CURSOR_BO | DRM_MODE_CURSOR_MOVE,
             .crtc_id = connector->crtc->id,
-            .x       = (int32_t)cursorPos.x,
-            .y       = (int32_t)cursorPos.y,
+            .x       = (int32_t)data.cursorPos.x,
+            .y       = (int32_t)data.cursorPos.y,
             .width   = (uint32_t)data.cursorFB->buffer->size.x,
             .height  = (uint32_t)data.cursorFB->buffer->size.y,
             .handle  = boHandle,
-            .hot_x   = (int32_t)connector->output->cursorHotspot.x,
-            .hot_y   = (int32_t)connector->output->cursorHotspot.y,
+            .hot_x   = (int32_t)data.cursorHotspot.x,
+            .hot_y   = (int32_t)data.cursorHotspot.y,
         };
 
         int ret = drmIoctl(connector->backend->gpu->fd, DRM_IOCTL_MODE_CURSOR2, &request);

@@ -39,3 +39,26 @@ void Aquamarine::IBuffer::unlock() {
 bool Aquamarine::IBuffer::locked() {
     return locks;
 }
+
+void Aquamarine::IBuffer::backendPin() {
+    backendPins++;
+    lockedByBackend = true;
+}
+
+void Aquamarine::IBuffer::backendUnpin() {
+    ASSERT(backendPins > 0);
+
+    if (backendPins == 0)
+        return;
+
+    backendPins--;
+    if (backendPins > 0)
+        return;
+
+    lockedByBackend = false;
+    events.backendRelease.emit();
+}
+
+uint32_t Aquamarine::IBuffer::backendPinCount() const {
+    return backendPins;
+}

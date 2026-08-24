@@ -1,6 +1,9 @@
 #include <aquamarine/output/Output.hpp>
+#include "Shared.hpp"
 
+#include <bit>
 #include <cerrno>
+#include <fcntl.h>
 
 using namespace Aquamarine;
 
@@ -67,8 +70,65 @@ bool Aquamarine::IOutput::destroy() {
     return false;
 }
 
+Aquamarine::COutputState::CSnapshot::CSnapshot(const COutputState* owner, const SInternalState& state, const std::array<uint64_t, 16>& generations) :
+    m_owner(owner), m_state(state), m_generations(generations) {
+    if (!(m_state.committed & AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE) || m_state.explicitInFence < 0)
+        return;
+
+    const int DUPLICATED_FD = fcntl(m_state.explicitInFence, F_DUPFD_CLOEXEC, 0);
+    if (DUPLICATED_FD < 0) {
+        m_error                 = errno;
+        m_state.explicitInFence = -1;
+        return;
+    }
+
+    m_explicitInFence       = Hyprutils::OS::CFileDescriptor{DUPLICATED_FD};
+    m_state.explicitInFence = m_explicitInFence.get();
+}
+
+const Aquamarine::COutputState::SInternalState& Aquamarine::COutputState::CSnapshot::state() const {
+    return m_state;
+}
+
+bool Aquamarine::COutputState::CSnapshot::needsReconfig() const {
+    return m_state.committed & (AQ_OUTPUT_STATE_ENABLED | AQ_OUTPUT_STATE_FORMAT | AQ_OUTPUT_STATE_MODE | AQ_OUTPUT_STATE_HDR | AQ_OUTPUT_STATE_WCG);
+}
+
+int Aquamarine::COutputState::CSnapshot::error() const {
+    return m_error;
+}
+
 const Aquamarine::COutputState::SInternalState& Aquamarine::COutputState::state() {
     return internalState;
+}
+
+const Aquamarine::COutputState::SInternalState& Aquamarine::COutputState::state() const {
+    return internalState;
+}
+
+Aquamarine::COutputState::CSnapshot Aquamarine::COutputState::snapshot() const {
+    return CSnapshot{this, internalState, propertyGenerations};
+}
+
+void Aquamarine::COutputState::consume(const CSnapshot& snapshot) {
+    ASSERT(snapshot.m_owner == this);
+    if (snapshot.m_owner != this)
+        return;
+
+    uint32_t properties = snapshot.m_state.committed;
+
+    while (properties) {
+        const uint32_t property = 1U << std::countr_zero(properties);
+        const size_t   index    = std::countr_zero(property);
+        properties &= ~property;
+
+        if (!(internalState.committed & property) || propertyGenerations.at(index) != snapshot.m_generations.at(index))
+            continue;
+
+        internalState.committed &= ~property;
+        if (property == AQ_OUTPUT_STATE_DAMAGE)
+            internalState.damage.clear();
+    }
 }
 
 bool Aquamarine::COutputState::needsReconfig() const {
@@ -77,68 +137,68 @@ bool Aquamarine::COutputState::needsReconfig() const {
 
 void Aquamarine::COutputState::addDamage(const Hyprutils::Math::CRegion& region) {
     internalState.damage.add(region);
-    internalState.committed |= AQ_OUTPUT_STATE_DAMAGE;
+    markCommitted(AQ_OUTPUT_STATE_DAMAGE);
 }
 
 void Aquamarine::COutputState::clearDamage() {
     internalState.damage.clear();
-    internalState.committed |= AQ_OUTPUT_STATE_DAMAGE;
+    markCommitted(AQ_OUTPUT_STATE_DAMAGE);
 }
 
 void Aquamarine::COutputState::setEnabled(bool enabled) {
     internalState.enabled = enabled;
-    internalState.committed |= AQ_OUTPUT_STATE_ENABLED;
+    markCommitted(AQ_OUTPUT_STATE_ENABLED);
 }
 
 void Aquamarine::COutputState::setAdaptiveSync(bool enabled) {
     internalState.adaptiveSync = enabled;
-    internalState.committed |= AQ_OUTPUT_STATE_ADAPTIVE_SYNC;
+    markCommitted(AQ_OUTPUT_STATE_ADAPTIVE_SYNC);
 }
 
 void Aquamarine::COutputState::setPresentationMode(eOutputPresentationMode mode) {
     internalState.presentationMode = mode;
-    internalState.committed |= AQ_OUTPUT_STATE_PRESENTATION_MODE;
+    markCommitted(AQ_OUTPUT_STATE_PRESENTATION_MODE);
 }
 
 void Aquamarine::COutputState::setGammaLut(const std::vector<uint16_t>& lut) {
     internalState.gammaLut = lut;
-    internalState.committed |= AQ_OUTPUT_STATE_GAMMA_LUT;
+    markCommitted(AQ_OUTPUT_STATE_GAMMA_LUT);
 }
 
 void Aquamarine::COutputState::setDeGammaLut(const std::vector<uint16_t>& lut) {
     internalState.degammaLut = lut;
-    internalState.committed |= AQ_OUTPUT_STATE_DEGAMMA_LUT;
+    markCommitted(AQ_OUTPUT_STATE_DEGAMMA_LUT);
 }
 
 void Aquamarine::COutputState::setMode(Hyprutils::Memory::CSharedPointer<SOutputMode> mode) {
     internalState.mode       = mode;
     internalState.customMode = nullptr;
-    internalState.committed |= AQ_OUTPUT_STATE_MODE;
+    markCommitted(AQ_OUTPUT_STATE_MODE);
 }
 
 void Aquamarine::COutputState::setCustomMode(Hyprutils::Memory::CSharedPointer<SOutputMode> mode) {
     internalState.mode.reset();
     internalState.customMode = mode;
-    internalState.committed |= AQ_OUTPUT_STATE_MODE;
+    markCommitted(AQ_OUTPUT_STATE_MODE);
 }
 
 void Aquamarine::COutputState::setFormat(uint32_t drmFormat) {
     internalState.drmFormat = drmFormat;
-    internalState.committed |= AQ_OUTPUT_STATE_FORMAT;
+    markCommitted(AQ_OUTPUT_STATE_FORMAT);
 }
 
 void Aquamarine::COutputState::setBuffer(Hyprutils::Memory::CSharedPointer<IBuffer> buffer) {
     internalState.buffer = buffer;
-    internalState.committed |= AQ_OUTPUT_STATE_BUFFER;
+    markCommitted(AQ_OUTPUT_STATE_BUFFER);
 }
 
 void Aquamarine::COutputState::setExplicitInFence(int32_t fenceFD) {
     internalState.explicitInFence = fenceFD;
-    internalState.committed |= AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE;
+    markCommitted(AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE);
 }
 
 void Aquamarine::COutputState::enableExplicitOutFenceForNextCommit() {
-    internalState.committed |= AQ_OUTPUT_STATE_EXPLICIT_OUT_FENCE;
+    markCommitted(AQ_OUTPUT_STATE_EXPLICIT_OUT_FENCE);
 }
 
 void Aquamarine::COutputState::resetExplicitFences() {
@@ -149,17 +209,17 @@ void Aquamarine::COutputState::resetExplicitFences() {
 
 void Aquamarine::COutputState::setCTM(const Hyprutils::Math::Mat3x3& ctm) {
     internalState.ctm = ctm;
-    internalState.committed |= AQ_OUTPUT_STATE_CTM;
+    markCommitted(AQ_OUTPUT_STATE_CTM);
 }
 
 void Aquamarine::COutputState::setWideColorGamut(bool wcg) {
     internalState.wideColorGamut = wcg;
-    internalState.committed |= AQ_OUTPUT_STATE_WCG;
+    markCommitted(AQ_OUTPUT_STATE_WCG);
 }
 
 void Aquamarine::COutputState::setHDRMetadata(const hdr_output_metadata& metadata) {
     internalState.hdrMetadata = metadata;
-    internalState.committed |= AQ_OUTPUT_STATE_HDR;
+    markCommitted(AQ_OUTPUT_STATE_HDR);
 }
 
 void Aquamarine::COutputState::setContentType(const uint16_t drmContentType) {
@@ -170,7 +230,12 @@ void Aquamarine::COutputState::setColorRange(eOutputColorRange range) {
     internalState.colorRange = range;
 }
 
-void Aquamarine::COutputState::onCommit() {
-    internalState.committed = 0;
-    internalState.damage.clear();
+void Aquamarine::COutputState::markCommitted(uint32_t properties) {
+    internalState.committed |= properties;
+
+    while (properties) {
+        const uint32_t property = 1U << std::countr_zero(properties);
+        properties &= ~property;
+        propertyGenerations.at(std::countr_zero(property)) = ++nextGeneration;
+    }
 }

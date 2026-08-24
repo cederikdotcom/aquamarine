@@ -1,12 +1,14 @@
 #pragma once
 
 #include <chrono>
+#include <array>
 #include <vector>
 #include <optional>
 #include <hyprutils/signal/Signal.hpp>
 #include <hyprutils/memory/SharedPtr.hpp>
 #include <hyprutils/math/Region.hpp>
 #include <hyprutils/math/Mat3x3.hpp>
+#include <hyprutils/os/FileDescriptor.hpp>
 #include <drm_fourcc.h>
 #include <xf86drmMode.h>
 #include "../allocator/Swapchain.hpp"
@@ -84,12 +86,35 @@ namespace Aquamarine {
             int32_t                                        explicitInFence = -1, explicitOutFence = -1;
             Hyprutils::Math::Mat3x3                        ctm            = Hyprutils::Math::Mat3x3::identity();
             bool                                           wideColorGamut = false;
-            hdr_output_metadata                            hdrMetadata;
-            uint16_t                                       contentType = DRM_MODE_CONTENT_TYPE_GRAPHICS;
-            eOutputColorRange                              colorRange  = AQ_OUTPUT_COLOR_RANGE_AUTO;
+            hdr_output_metadata                            hdrMetadata    = {};
+            uint16_t                                       contentType    = DRM_MODE_CONTENT_TYPE_GRAPHICS;
+            eOutputColorRange                              colorRange     = AQ_OUTPUT_COLOR_RANGE_AUTO;
+        };
+
+        class CSnapshot {
+          public:
+            CSnapshot(CSnapshot&&) = default;
+
+            const SInternalState& state() const;
+            bool                  needsReconfig() const;
+            int                   error() const;
+
+          private:
+            CSnapshot(const COutputState* owner, const SInternalState& state, const std::array<uint64_t, 16>& generations);
+
+            const COutputState*            m_owner = nullptr;
+            SInternalState                 m_state;
+            std::array<uint64_t, 16>       m_generations = {};
+            Hyprutils::OS::CFileDescriptor m_explicitInFence;
+            int                            m_error = 0;
+
+            friend class COutputState;
         };
 
         const SInternalState& state();
+        const SInternalState& state() const;
+        CSnapshot             snapshot() const;
+        void                  consume(const CSnapshot& snapshot);
 
         bool                  needsReconfig() const;
         void                  addDamage(const Hyprutils::Math::CRegion& region);
@@ -113,14 +138,17 @@ namespace Aquamarine {
         void                  setColorRange(eOutputColorRange range);
 
       private:
-        SInternalState internalState;
+        SInternalState           internalState;
+        std::array<uint64_t, 16> propertyGenerations = {};
+        uint64_t                 nextGeneration      = 0;
 
-        void           onCommit(); // clears a few props like damage and committed.
+        void                     markCommitted(uint32_t properties);
 
         friend class IOutput;
         friend class CWaylandOutput;
         friend class CDRMOutput;
         friend class CHeadlessOutput;
+        friend struct SDRMConnector;
     };
 
     class IOutput {

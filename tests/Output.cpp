@@ -2,6 +2,8 @@
 #include <aquamarine/backend/Backend.hpp>
 #include <hyprutils/memory/SharedPtr.hpp>
 #include <cerrno>
+#include <fcntl.h>
+#include <unistd.h>
 #include "OutputTiming.hpp"
 #include "shared.hpp"
 
@@ -15,7 +17,7 @@ class CTestOutput : public IOutput {
     }
 
     virtual bool test() {
-        return false;
+        return true;
     }
 
     virtual CSharedPointer<IBackendImplementation> getBackend() {
@@ -35,9 +37,98 @@ class CTestOutput : public IOutput {
     }
 };
 
+class CTestBuffer : public IBuffer {
+  public:
+    virtual eBufferCapability caps() {
+        return BUFFER_CAPABILITY_NONE;
+    }
+
+    virtual eBufferType type() {
+        return BUFFER_TYPE_MISC;
+    }
+
+    virtual void update(const Hyprutils::Math::CRegion& damage) {
+        ;
+    }
+
+    virtual bool isSynchronous() {
+        return true;
+    }
+
+    virtual bool good() {
+        return true;
+    }
+};
+
 int main() {
     int         ret = 0;
     CTestOutput output;
+
+    CTestBuffer buffer;
+    int         backendReleases = 0;
+    auto        releaseListener = buffer.events.backendRelease.listen([&] { backendReleases++; });
+
+    buffer.backendPin();
+    buffer.backendPin();
+    EXPECT(buffer.backendPinCount(), 2U);
+    EXPECT(buffer.lockedByBackend, true);
+    buffer.backendUnpin();
+    EXPECT(buffer.backendPinCount(), 1U);
+    EXPECT(buffer.lockedByBackend, true);
+    EXPECT(backendReleases, 0);
+    buffer.backendUnpin();
+    EXPECT(buffer.backendPinCount(), 0U);
+    EXPECT(buffer.lockedByBackend, false);
+    EXPECT(backendReleases, 1);
+    buffer.backendPin();
+    buffer.backendUnpin();
+    EXPECT(backendReleases, 2);
+
+    COutputState outputState;
+    outputState.setEnabled(true);
+    outputState.addDamage(Hyprutils::Math::CRegion{0, 0, 10, 10});
+    const auto FIRST_SNAPSHOT = outputState.snapshot();
+
+    outputState.setEnabled(false);
+    outputState.addDamage(Hyprutils::Math::CRegion{20, 20, 10, 10});
+    EXPECT(FIRST_SNAPSHOT.state().enabled, true);
+    EXPECT(FIRST_SNAPSHOT.state().damage.empty(), false);
+
+    outputState.consume(FIRST_SNAPSHOT);
+    EXPECT(outputState.state().enabled, false);
+    EXPECT(!!(outputState.state().committed & COutputState::AQ_OUTPUT_STATE_ENABLED), true);
+    EXPECT(!!(outputState.state().committed & COutputState::AQ_OUTPUT_STATE_DAMAGE), true);
+    EXPECT(outputState.state().damage.empty(), false);
+
+    const auto SECOND_SNAPSHOT = outputState.snapshot();
+    outputState.consume(SECOND_SNAPSHOT);
+    EXPECT(outputState.state().committed, 0U);
+    EXPECT(outputState.state().damage.empty(), true);
+
+    outputState.setFormat(DRM_FORMAT_XRGB8888);
+    outputState.setAdaptiveSync(true);
+    const auto PARTIAL_SNAPSHOT = outputState.snapshot();
+    outputState.setAdaptiveSync(false);
+    outputState.consume(PARTIAL_SNAPSHOT);
+    EXPECT(!!(outputState.state().committed & COutputState::AQ_OUTPUT_STATE_FORMAT), false);
+    EXPECT(!!(outputState.state().committed & COutputState::AQ_OUTPUT_STATE_ADAPTIVE_SYNC), true);
+
+    int pipeFDs[2] = {-1, -1};
+    EXPECT(pipe(pipeFDs), 0);
+    if (pipeFDs[0] >= 0) {
+        COutputState fenceState;
+        fenceState.setExplicitInFence(pipeFDs[0]);
+        const auto FENCE_SNAPSHOT = fenceState.snapshot();
+        EXPECT(FENCE_SNAPSHOT.error(), 0);
+        EXPECT(FENCE_SNAPSHOT.state().explicitInFence == pipeFDs[0], false);
+        close(pipeFDs[0]);
+        close(pipeFDs[1]);
+        EXPECT(fcntl(FENCE_SNAPSHOT.state().explicitInFence, F_GETFD) >= 0, true);
+    }
+
+    output.state->setEnabled(true);
+    EXPECT(output.test(), true);
+    EXPECT(!!(output.state->state().committed & COutputState::AQ_OUTPUT_STATE_ENABLED), true);
 
     EXPECT(output.hasCursorPlane(), false);
     EXPECT(output.nextVBlank().has_value(), false);

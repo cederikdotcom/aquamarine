@@ -58,6 +58,9 @@ namespace Aquamarine {
         virtual void                                   lock();
         virtual void                                   unlock();
         virtual bool                                   locked();
+        void                                           backendPin();
+        void                                           backendUnpin();
+        uint32_t                                       backendPinCount() const;
 
         Hyprutils::Math::Vector2D                      size;
         bool                                           opaque          = false;
@@ -71,7 +74,8 @@ namespace Aquamarine {
         } events;
 
       private:
-        int locks = 0;
+        int      locks       = 0;
+        uint32_t backendPins = 0;
     };
 
 };
