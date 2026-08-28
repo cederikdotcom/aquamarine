@@ -6,8 +6,10 @@
 #include "../input/Input.hpp"
 #include "FrameScheduler.hpp"
 #include <hyprutils/memory/WeakPtr.hpp>
+#include <hyprutils/memory/Atomic.hpp>
 #include <wayland-client.h>
 #include <xf86drmMode.h>
+#include <memory>
 #include <optional>
 
 namespace Aquamarine {
@@ -17,6 +19,12 @@ namespace Aquamarine {
     struct SDRMConnector;
     class CDRMRenderer;
     class CDRMDumbAllocator;
+    class CDRMCommitThread;
+    class CDRMCursorPositionMailbox;
+    class CDRMAsyncCommitData;
+    struct SDRMConnectorCommitData;
+
+    using DRMFBList = std::vector<Hyprutils::Memory::CSharedPointer<CDRMFB>>;
 
     typedef std::function<void(void)> FIdleCallback;
 
@@ -116,6 +124,7 @@ namespace Aquamarine {
         Hyprutils::Memory::CSharedPointer<CDRMFB>    front /* currently displaying */, back /* submitted */, last /* keep just in case */;
         Hyprutils::Memory::CWeakPointer<CDRMBackend> backend;
         Hyprutils::Memory::CWeakPointer<SDRMPlane>   self;
+        bool                                         backSet = false;
         std::vector<SDRMFormat>                      formats;
 
         union UDRMPlaneProps {
@@ -165,10 +174,20 @@ namespace Aquamarine {
         struct {
             std::optional<uintptr_t>                       id; // nullopt when nothing is in flight
             Hyprutils::Memory::CWeakPointer<SDRMConnector> connector;
-            bool                                           async = false; // PAGE_FLIP_ASYNC
+            bool                                           async       = false; // PAGE_FLIP_ASYNC
+            uint64_t                                       commitID    = 0;
+            bool                                           resultReady = true;
+
+            struct {
+                bool         valid = false;
+                unsigned int seq   = 0;
+                unsigned int sec   = 0;
+                unsigned int usec  = 0;
+            } early;
         } pendingFlip;
 
-        uintptr_t armPageFlip(Hyprutils::Memory::CWeakPointer<SDRMConnector> connector, bool async);
+        uintptr_t armPageFlip(Hyprutils::Memory::CWeakPointer<SDRMConnector> connector, bool async, std::optional<uintptr_t> id = std::nullopt, uint64_t commitID = 0,
+                              bool resultReady = true);
         void      disarmPageFlip();
 
         struct {
@@ -229,6 +248,8 @@ namespace Aquamarine {
         virtual std::vector<SDRMFormat>                                   getRenderFormats();
         virtual bool                                                      pendingPageFlip();
         virtual bool                                                      pendingIdleFrame();
+        virtual uint32_t                                                  commitCapabilities() const;
+        virtual SCommitSubmission                                         commitAsync(const SCommitOptions& options);
         void                                                              releaseMgpuResources();
 
         int                                                               getConnectorID();
@@ -244,7 +265,9 @@ namespace Aquamarine {
       private:
         CDRMOutput(const std::string& name_, Hyprutils::Memory::CWeakPointer<CDRMBackend> backend_, Hyprutils::Memory::CSharedPointer<SDRMConnector> connector_);
 
-        bool                                                         commitState(bool onlyTest = false);
+        bool commitState(bool onlyTest = false);
+        bool prepareAsyncCommitData(const COutputState::CSnapshot& snapshot, SDRMConnectorCommitData& data, Hyprutils::OS::CFileDescriptor& mgpuFence, bool& mgpuAcquired,
+                                    bool& requiresSync);
 
         Hyprutils::Memory::CWeakPointer<CDRMBackend>                 backend;
         Hyprutils::Memory::CSharedPointer<SDRMConnector>             connector;
@@ -257,20 +280,29 @@ namespace Aquamarine {
             Hyprutils::Memory::CSharedPointer<CSwapchain> cursorSwapchain;
         } mgpu;
 
-        bool lastCommitNoBuffer = true;
+        bool                                                               lastCommitNoBuffer = true;
+        uint64_t                                                           asyncOwnerID = 0, pendingAsyncCommit = 0;
+        bool                                                               asyncCommitEventPending = false;
+        Hyprutils::Memory::CAtomicSharedPointer<CDRMCursorPositionMailbox> cursorMailbox;
 
         friend struct SDRMConnector;
         friend class CDRMLease;
+        friend class CDRMBackend;
     };
 
     struct SDRMConnectorCommitData {
         Hyprutils::Memory::CSharedPointer<CDRMFB> mainFB, cursorFB;
-        bool                                      modeset   = false;
-        bool                                      blocking  = false;
-        uint32_t                                  flags     = 0;
-        bool                                      test      = false;
-        bool                                      enabled   = false;
-        uint32_t                                  committed = 0;
+        COutputState::SInternalState              outputState;
+        Hyprutils::Math::Vector2D                 cursorPos, cursorHotspot;
+        bool                                      cursorVisible    = false;
+        bool                                      modeset          = false;
+        bool                                      blocking         = false;
+        uint32_t                                  flags            = 0;
+        bool                                      test             = false;
+        bool                                      enabled          = false;
+        uint32_t                                  committed        = 0;
+        bool                                      primaryFBChanged = false, cursorFBChanged = false;
+        DRMFBList                                 retiredFBs;
         Hyprutils::Math::CRegion                  damage;
         drmModeModeInfo                           modeInfo;
         std::optional<Hyprutils::Math::Mat3x3>    ctm;
@@ -327,12 +359,12 @@ namespace Aquamarine {
         drmModeModeInfo*                               getCurrentMode();
         IOutput::SParsedEDID                           parseEDID(std::vector<uint8_t> data);
         bool                                           commitState(SDRMConnectorCommitData& data);
-        void                                           applyCommit(const SDRMConnectorCommitData& data);
-        void                                           onPresent();
+        void                                           applyCommit(SDRMConnectorCommitData& data);
+        void                                           onPresent(bool primary = true, bool cursor = true, DRMFBList* retired = nullptr);
         void                                           recheckCRTCProps();
         void                                           parseTileInfo();
         void                                           releaseFBBuffer(const Hyprutils::Memory::CSharedPointer<CDRMFB> fb);
-        void                                           releaseFBReferences();
+        void                                           releaseFBReferences(DRMFBList* retired = nullptr);
         void                                           invalidateFrame();
         void                                           setCRTC(Hyprutils::Memory::CSharedPointer<SDRMCRTC> newCRTC);
 
@@ -359,7 +391,7 @@ namespace Aquamarine {
         CFrameScheduler                                sched;
 
         // the current state is invalid and won't commit, don't try to modeset.
-        bool                                           commitTainted = false;
+        bool commitTainted = false;
 
         // set when an atomic commit with max_bpc fails; skips max_bpc on future
         // commits for this connector (works around buggy drivers, e.g. amdgpu eDP).
@@ -372,11 +404,12 @@ namespace Aquamarine {
 
             // last connector_state values successfully committed to the kernel. used
             // to skip re-emitting unchanged values on page-flips (see #265).
-            uint64_t maxBpc      = 0;
-            uint64_t colorspace  = 0;
-            uint16_t contentType = 0;
-            uint32_t crtcID      = 0;
-            bool     propsCached = false;
+            uint64_t          maxBpc      = 0;
+            uint64_t          colorspace  = 0;
+            uint16_t          contentType = 0;
+            uint32_t          crtcID      = 0;
+            bool              propsCached = false;
+            eOutputColorRange colorRange  = AQ_OUTPUT_COLOR_RANGE_AUTO;
         } atomic;
 
         union UDRMConnectorProps {
@@ -455,6 +488,9 @@ namespace Aquamarine {
         virtual eBackendGPUDriver                                          gpuDriver();
         Hyprutils::Memory::CSharedPointer<SDRMCRTC>                        crtcByID(uint32_t id);
 
+        void                                                               dispatchCommitResults();
+        void                                                               handlePageFlip(uintptr_t flipID, unsigned int seq, unsigned int sec, unsigned int usec, uint32_t crtcID);
+
       private:
         CDRMBackend(Hyprutils::Memory::CSharedPointer<CBackend> backend);
 
@@ -462,20 +498,28 @@ namespace Aquamarine {
         static Hyprutils::Memory::CSharedPointer<CDRMBackend>              fromGpu(std::string path, Hyprutils::Memory::CSharedPointer<CBackend> backend,
                                                                                    Hyprutils::Memory::CSharedPointer<CDRMBackend> primary);
 
-        bool registerGPU(Hyprutils::Memory::CSharedPointer<CSessionDevice> gpu_, Hyprutils::Memory::CSharedPointer<CDRMBackend> primary_ = {});
-        bool checkFeatures();
-        bool initResources();
-        bool initMgpu();
-        bool updateSecondaryRendererState();
-        bool grabFormats();
-        bool shouldBlit();
-        void scanConnectors();
-        void scanLeases();
-        void restoreAfterVT();
-        void recheckOutputs();
-        void recheckCRTCs();
-        void markRedundantTiles();
-        void buildGlFormats(const std::vector<SGLFormat>& fmts);
+        bool     registerGPU(Hyprutils::Memory::CSharedPointer<CSessionDevice> gpu_, Hyprutils::Memory::CSharedPointer<CDRMBackend> primary_ = {});
+        bool     checkFeatures();
+        bool     initResources();
+        bool     initMgpu();
+        bool     updateSecondaryRendererState(DRMFBList* retired = nullptr);
+        bool     grabFormats();
+        bool     shouldBlit();
+        void     scanConnectors();
+        void     scanLeases();
+        void     restoreAfterVT();
+        void     recheckOutputs();
+        void     recheckCRTCs();
+        void     markRedundantTiles();
+        void     buildGlFormats(const std::vector<SGLFormat>& fmts);
+        bool     initCommitThread();
+        void     stopCommitThread();
+        void     cancelAsyncOutput(CDRMOutput* output, bool renewOwner = false);
+        void     emitAsyncCommitEvent(Hyprutils::Memory::CSharedPointer<CDRMOutput> output);
+        void     flushAsyncCommitEvents();
+        bool     pauseCommitQueue(uint64_t queueKey);
+        void     resumeCommitQueue(uint64_t queueKey);
+        uint64_t nextAsyncOwnerID();
 
         Hyprutils::Memory::CSharedPointer<CSessionDevice>     gpu;
         Hyprutils::Memory::CSharedPointer<IDRMImplementation> impl;
@@ -496,8 +540,12 @@ namespace Aquamarine {
         std::vector<Hyprutils::Memory::CSharedPointer<SDRMConnector>> connectors;
         std::vector<SDRMFormat>                                       formats;
         std::vector<SDRMFormat>                                       glFormats;
-        uintptr_t                                                     m_lastPageFlipID = 0;
+        uintptr_t                                                     m_lastPageFlipID           = 0;
+        uint64_t                                                      m_lastAsyncOwnerID         = 0;
+        size_t                                                        m_pendingAsyncCommitEvents = 0;
         uintptr_t                                                     nextPageFlipID();
+        Hyprutils::Memory::CUniquePointer<CDRMCommitThread>           commitThread;
+        std::chrono::microseconds                                     commitLeadTime = std::chrono::microseconds{2000};
 
         Hyprutils::Memory::CSharedPointer<CDRMDumbAllocator>          dumbAllocator;
 
@@ -523,6 +571,8 @@ namespace Aquamarine {
         friend struct SDRMCRTC;
         friend struct SDRMPlane;
         friend class CDRMOutput;
+        friend class CDRMAsyncCommitData;
+        friend struct SDRMConnector;
         friend class CDRMLegacyImpl;
         friend class CDRMAtomicImpl;
         friend class CDRMAtomicRequest;

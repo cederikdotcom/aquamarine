@@ -25,8 +25,9 @@ Aquamarine::CHeadlessOutput::~CHeadlessOutput() {
 }
 
 bool Aquamarine::CHeadlessOutput::commit() {
+    const auto snapshot = state->snapshot();
     events.commit.emit();
-    state->onCommit();
+    state->consume(snapshot);
     needsFrame = false;
     events.present.emit(IOutput::SPresentEvent{.presented = true});
     return true;

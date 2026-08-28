@@ -615,18 +615,20 @@ bool Aquamarine::CWaylandOutput::test() {
 }
 
 bool Aquamarine::CWaylandOutput::commit() {
-    Vector2D pixelSize = {};
+    const auto  snapshot  = state->snapshot();
+    const auto& STATE     = snapshot.state();
+    Vector2D    pixelSize = {};
 
-    if (state->internalState.customMode)
-        pixelSize = state->internalState.customMode->pixelSize;
-    else if (state->internalState.mode)
-        pixelSize = state->internalState.mode->pixelSize;
+    if (STATE.customMode)
+        pixelSize = STATE.customMode->pixelSize;
+    else if (STATE.mode)
+        pixelSize = STATE.mode->pixelSize;
     else {
         backend->backend->log(AQ_LOG_ERROR, std::format("Output {}: pending state rejected: invalid mode", name));
         return false;
     }
 
-    uint32_t format = state->internalState.drmFormat;
+    uint32_t format = STATE.drmFormat;
 
     if (format == DRM_FORMAT_INVALID) {
         backend->backend->log(AQ_LOG_ERROR, std::format("Output {}: pending state rejected: invalid format", name));
@@ -643,19 +645,19 @@ bool Aquamarine::CWaylandOutput::commit() {
         return false;
     }
 
-    if (!state->internalState.buffer) {
+    if (!STATE.buffer) {
         // if the consumer explicitly committed a null buffer, that's a violation.
-        if (state->internalState.committed & COutputState::AQ_OUTPUT_STATE_BUFFER) {
+        if (STATE.committed & COutputState::AQ_OUTPUT_STATE_BUFFER) {
             backend->backend->log(AQ_LOG_ERROR, std::format("Output {}: pending state rejected: no buffer", name));
             return false;
         }
 
         events.commit.emit();
-        state->onCommit();
+        state->consume(snapshot);
         return true;
     }
 
-    auto wlBuffer = wlBufferFromBuffer(state->internalState.buffer);
+    auto wlBuffer = wlBufferFromBuffer(STATE.buffer);
 
     if (!wlBuffer) {
         backend->backend->log(AQ_LOG_ERROR, std::format("Output {}: pending state rejected: no wlBuffer??", name));
@@ -686,7 +688,7 @@ bool Aquamarine::CWaylandOutput::commit() {
     }
 
     waylandState.surface->sendCommit();
-    waylandState.surfaceSize = state->internalState.buffer->size;
+    waylandState.surfaceSize = STATE.buffer->size;
 
     // Flush immediately: commit() runs from the consumer's render path, outside
     // dispatchEvents() (which flushes only at its top). Without this the buffer commit and
@@ -695,7 +697,7 @@ bool Aquamarine::CWaylandOutput::commit() {
     wl_display_flush(backend->waylandState.display);
 
     events.commit.emit();
-    state->onCommit();
+    state->consume(snapshot);
     needsFrame = false;
 
     return true;
