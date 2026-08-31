@@ -144,9 +144,15 @@ bool Aquamarine::CWaylandBackend::start() {
 
     wl_display_roundtrip(waylandState.display);
 
-    if (!waylandState.xdg || !waylandState.compositor || !waylandState.seat || !waylandState.dmabuf || waylandState.dmabufFailed || !waylandState.shm) {
+    if (!waylandState.xdg || !waylandState.compositor || !waylandState.seat || !waylandState.shm) {
         backend->log(AQ_LOG_ERROR, "Wayland backend cannot start: Missing protocols");
         return false;
+    }
+
+    if (!waylandState.dmabuf || waylandState.dmabufFailed) {
+        backend->log(AQ_LOG_WARNING, "Wayland backend: no zwp_linux_dmabuf_v1, only cpu (wl_shm) buffers will work");
+        waylandState.dmabuf.reset();
+        waylandState.dmabufFailed = false;
     }
 
     dispatchEvents();
@@ -469,6 +475,10 @@ bool Aquamarine::CWaylandBackend::initDmabuf() {
 }
 
 std::vector<SDRMFormat> Aquamarine::CWaylandBackend::getRenderFormats() {
+    if (dmabufFormats.empty()) {
+        // no dmabuf: advertise the wl_shm baseline (always supported by hosts)
+        return {SDRMFormat{.drmFormat = DRM_FORMAT_XRGB8888, .modifiers = {DRM_FORMAT_INVALID}}, SDRMFormat{.drmFormat = DRM_FORMAT_ARGB8888, .modifiers = {DRM_FORMAT_INVALID}}};
+    }
     return dmabufFormats;
 }
 
@@ -795,7 +805,7 @@ bool Aquamarine::CWaylandOutput::setCursor(Hyprutils::Memory::CSharedPointer<IBu
         pool.reset();
 
         close(fd);
-    } else if (auto attrs = buffer->dmabuf(); attrs.success) {
+    } else if (auto attrs = buffer->dmabuf(); attrs.success && backend->waylandState.dmabuf) {
         auto params = makeShared<CCZwpLinuxBufferParamsV1>(backend->waylandState.dmabuf->sendCreateParams());
 
         for (int i = 0; i < attrs.planes; ++i) {
@@ -862,6 +872,36 @@ void Aquamarine::CWaylandOutput::scheduleFrame(const scheduleFrameReason reason)
 }
 
 Aquamarine::CWaylandBuffer::CWaylandBuffer(SP<IBuffer> buffer_, Hyprutils::Memory::CWeakPointer<CWaylandBackend> backend_) : buffer(buffer_), backend(backend_) {
+    if (auto attrs = buffer->shm(); attrs.success) {
+        // cpu buffer: wrap the shm fd in a wl_shm pool (zero-copy, the host compositor
+        // reads our memfd directly)
+        const size_t len  = (size_t)attrs.stride * (size_t)attrs.size.y + attrs.offset;
+        auto         pool = makeShared<CCWlShmPool>(backend->waylandState.shm->sendCreatePool(attrs.fd, len));
+
+        if (!pool) {
+            backend->backend->log(AQ_LOG_ERROR, "WaylandBuffer: failed to create a wl_shm pool");
+            return;
+        }
+
+        waylandState.buffer = makeShared<CCWlBuffer>(pool->sendCreateBuffer(attrs.offset, attrs.size.x, attrs.size.y, attrs.stride, shmFormatFromDRM(attrs.format)));
+
+        pool->sendDestroy();
+
+        if (!waylandState.buffer) {
+            backend->backend->log(AQ_LOG_ERROR, "WaylandBuffer: failed to create a wl_buffer from a shm pool");
+            return;
+        }
+
+        waylandState.buffer->setRelease([this](CCWlBuffer* r) { pendingRelease = false; });
+
+        return;
+    }
+
+    if (!backend->waylandState.dmabuf) {
+        backend->backend->log(AQ_LOG_ERROR, "WaylandBuffer: cannot submit a non-shm buffer without zwp_linux_dmabuf_v1");
+        return;
+    }
+
     auto params = makeShared<CCZwpLinuxBufferParamsV1>(backend->waylandState.dmabuf->sendCreateParams());
 
     if (!params) {

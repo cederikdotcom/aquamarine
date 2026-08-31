@@ -4,6 +4,7 @@
 #include <aquamarine/backend/DRM.hpp>
 #include <aquamarine/backend/Null.hpp>
 #include <aquamarine/allocator/GBM.hpp>
+#include <aquamarine/allocator/Shm.hpp>
 #include <hyprutils/os/FileDescriptor.hpp>
 #include <ranges>
 #include <sys/timerfd.h>
@@ -159,17 +160,29 @@ bool Aquamarine::CBackend::start() {
         return failed;
     });
 
-    // TODO: obviously change this when (if) we add different allocators.
-    for (auto const& b : implementations) {
-        if (b->drmFD() >= 0) {
-            auto fd = reopenDRMNode(b->drmFD());
-            if (fd < 0) {
-                // this is critical, we cannot create an allocator properly
-                log(AQ_LOG_CRITICAL, "Failed to create an allocator (reopenDRMNode failed)");
-                return false;
+    const std::string forcedAllocator = getenv("AQ_FORCE_ALLOCATOR") ? getenv("AQ_FORCE_ALLOCATOR") : "";
+
+    if (forcedAllocator == "shm") {
+        log(AQ_LOG_DEBUG, "AQ_FORCE_ALLOCATOR: using a shm (cpu) allocator");
+        primaryAllocator = CShmAllocator::create(self);
+    } else {
+        for (auto const& b : implementations) {
+            if (b->drmFD() >= 0) {
+                auto fd = reopenDRMNode(b->drmFD());
+                if (fd < 0) {
+                    // this is critical, we cannot create an allocator properly
+                    log(AQ_LOG_CRITICAL, "Failed to create an allocator (reopenDRMNode failed)");
+                    return false;
+                }
+                primaryAllocator = CGBMAllocator::create(fd, self);
+                break;
             }
-            primaryAllocator = CGBMAllocator::create(fd, self);
-            break;
+        }
+
+        if (!primaryAllocator) {
+            // no implementation has a DRM fd: fall back to cpu (shm) buffers.
+            log(AQ_LOG_WARNING, "No DRM fd available from any backend implementation, falling back to a shm (cpu) allocator");
+            primaryAllocator = CShmAllocator::create(self);
         }
     }
 
