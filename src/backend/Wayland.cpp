@@ -116,17 +116,22 @@ bool Aquamarine::CWaylandBackend::start() {
 
         const std::string NAME = name;
 
+        // bind at most the version the host offers: hosts like sway advertise lower
+        // versions than hyprland and binding higher is a fatal protocol error
         if (NAME == "wl_seat") {
-            TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, 9, id)));
-            waylandState.seat = makeShared<CCWlSeat>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &wl_seat_interface, 9));
+            const auto VER = std::min(version, 9u);
+            TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, VER, id)));
+            waylandState.seat = makeShared<CCWlSeat>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &wl_seat_interface, VER));
             initSeat();
         } else if (NAME == "xdg_wm_base") {
-            TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, 6, id)));
-            waylandState.xdg = makeShared<CCXdgWmBase>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &xdg_wm_base_interface, 6));
+            const auto VER = std::min(version, 6u);
+            TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, VER, id)));
+            waylandState.xdg = makeShared<CCXdgWmBase>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &xdg_wm_base_interface, VER));
             initShell();
         } else if (NAME == "wl_compositor") {
-            TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, 6, id)));
-            waylandState.compositor = makeShared<CCWlCompositor>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &wl_compositor_interface, 6));
+            const auto VER = std::min(version, 6u);
+            TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, VER, id)));
+            waylandState.compositor = makeShared<CCWlCompositor>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &wl_compositor_interface, VER));
         } else if (NAME == "wl_shm") {
             TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, 1, id)));
             waylandState.shm = makeShared<CCWlShm>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &wl_shm_interface, 1));
@@ -158,6 +163,11 @@ bool Aquamarine::CWaylandBackend::start() {
     dispatchEvents();
 
     createOutput();
+
+    // flush the initial surface commit: without dmabuf there are no pending host events
+    // to wake the event loop (whose dispatch would flush as a side effect), and an
+    // unflushed commit means the host never sends the first configure
+    wl_display_flush(waylandState.display);
 
     return true;
 }
@@ -555,6 +565,15 @@ Aquamarine::CWaylandOutput::CWaylandOutput(const std::string& name_, Hyprutils::
             w = 1280;
             h = 720;
         }
+
+        // advertise the configured size as the sole (preferred) mode: a configure that
+        // arrives before the consumer has attached its state listener is otherwise lost
+        // and a wayland output has no modes to fall back to
+        if (modes.empty() || modes[0]->pixelSize != Vector2D{w, h}) {
+            modes.clear();
+            modes.emplace_back(SP<SOutputMode>(new SOutputMode{.pixelSize = {(double)w, (double)h}, .refreshRate = 60000, .preferred = true}));
+        }
+
         events.state.emit(SStateEvent{.size = {w, h}});
         // Kick off the first frame synchronously: the consumer expects events.frame in
         // the same dispatch cycle as the toplevel configure. Deferring via scheduleFrame's

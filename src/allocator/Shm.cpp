@@ -23,10 +23,12 @@ static uint32_t bppFromDRMFormat(uint32_t format) {
 
 Aquamarine::CShmBuffer::CShmBuffer(const SAllocatorBufferParams& params, Hyprutils::Memory::CWeakPointer<CShmAllocator> allocator_,
                                    Hyprutils::Memory::CSharedPointer<CSwapchain> swapchain) : allocator(allocator_) {
-    attrs.format = params.format;
+    // a swapchain without an explicit format normally resolves one from the first
+    // buffer's dmabuf attrs, which a shm buffer doesn't have: pick a sane default
+    attrs.format = params.format == DRM_FORMAT_INVALID ? DRM_FORMAT_ARGB8888 : params.format;
 
     pixelSize = params.size;
-    stride    = (uint32_t)params.size.x * bppFromDRMFormat(params.format);
+    stride    = (uint32_t)params.size.x * bppFromDRMFormat(attrs.format);
     bufferLen = (uint64_t)stride * (uint64_t)params.size.y;
 
     fd = memfd_create("aq-shm-buffer", MFD_CLOEXEC | MFD_ALLOW_SEALING);
