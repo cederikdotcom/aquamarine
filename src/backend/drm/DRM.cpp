@@ -861,6 +861,18 @@ bool Aquamarine::CDRMBackend::initMgpu() {
     if (!rendererRequired)
         return true;
 
+    // A cpu (dumb / shm) primary allocator means the whole pipeline is software: the
+    // compositor renders into a mappable buffer that is scanned out directly. There is
+    // no EGL/GBM renderer to build and nothing to blit (shouldBlit() is false without a
+    // primary), so treat it exactly like evdi - KMS without a usable EGL renderer.
+    // Without this, every commit retries CDRMRenderer::attempt() and floods the log with
+    // MESA-LOADER / eglQueryDeviceStringEXT failures, which is pure waste on a CPU-only host.
+    if (backend->primaryAllocator && backend->primaryAllocator->type() != AQ_ALLOCATOR_TYPE_GBM) {
+        backend->log(AQ_LOG_DEBUG, "drm: cpu (non-gbm) primary allocator, no gl renderer required");
+        rendererRequired = false;
+        return true;
+    }
+
     SP<CGBMAllocator> newAllocator;
     if (primary || backend->primaryAllocator->type() != AQ_ALLOCATOR_TYPE_GBM) {
         newAllocator            = CGBMAllocator::create(backend->reopenDRMNode(gpu->fd), backend);
@@ -1533,6 +1545,11 @@ bool Aquamarine::CDRMBackend::setCursor(SP<IBuffer> buffer, const Hyprutils::Mat
 
 void Aquamarine::CDRMBackend::onReady() {
     backend->log(AQ_LOG_DEBUG, std::format("drm: Connectors size2 {}", connectors.size()));
+
+    // a cpu (dumb / shm) primary allocator has no gl pipeline at all: skip the gl format
+    // probe, it can only fail (and does, loudly, on a GPU-less host). See initMgpu().
+    if (backend->primaryAllocator && backend->primaryAllocator->type() != AQ_ALLOCATOR_TYPE_GBM)
+        rendererRequired = false;
 
     // init a drm renderer to gather gl formats.
     // if we are secondary, initMgpu will have done that

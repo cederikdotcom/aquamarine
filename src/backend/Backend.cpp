@@ -5,6 +5,7 @@
 #include <aquamarine/backend/Null.hpp>
 #include <aquamarine/allocator/GBM.hpp>
 #include <aquamarine/allocator/Shm.hpp>
+#include <aquamarine/allocator/DRMDumb.hpp>
 #include <hyprutils/os/FileDescriptor.hpp>
 #include <ranges>
 #include <sys/timerfd.h>
@@ -166,18 +167,28 @@ bool Aquamarine::CBackend::start() {
         log(AQ_LOG_DEBUG, "AQ_FORCE_ALLOCATOR: using a shm (cpu) allocator");
         primaryAllocator = CShmAllocator::create(self);
     } else {
+        // dumb buffers only exist on the primary (card) node, never on a render node.
+        const bool wantDumb = forcedAllocator == "dumb";
+
         for (auto const& b : implementations) {
             if (b->drmFD() >= 0) {
-                auto fd = reopenDRMNode(b->drmFD());
+                auto fd = reopenDRMNode(b->drmFD(), !wantDumb);
                 if (fd < 0) {
                     // this is critical, we cannot create an allocator properly
                     log(AQ_LOG_CRITICAL, "Failed to create an allocator (reopenDRMNode failed)");
                     return false;
                 }
-                primaryAllocator = CGBMAllocator::create(fd, self);
+                if (wantDumb) {
+                    log(AQ_LOG_DEBUG, "AQ_FORCE_ALLOCATOR: using a drm dumb (cpu) allocator");
+                    primaryAllocator = CDRMDumbAllocator::create(fd, self);
+                } else
+                    primaryAllocator = CGBMAllocator::create(fd, self);
                 break;
             }
         }
+
+        if (!primaryAllocator && wantDumb)
+            log(AQ_LOG_ERROR, "AQ_FORCE_ALLOCATOR=dumb requested but no backend exposes a DRM fd");
 
         if (!primaryAllocator) {
             // no implementation has a DRM fd: fall back to cpu (shm) buffers.
