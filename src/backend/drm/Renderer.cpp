@@ -82,8 +82,7 @@ static GLuint createProgram(const std::string& vert, const std::string& frag) {
     return prog;
 }
 
-inline const std::string VERT_SRC = R"#(
-#version 300 es
+inline const std::string VERT_SRC = R"#(#version 300 es
 precision highp float;
 
 uniform mat3 proj;
@@ -98,8 +97,7 @@ void main() {
     v_texcoord = texcoord;
 })#";
 
-inline const std::string FRAG_SRC = R"#(
-#version 300 es
+inline const std::string FRAG_SRC = R"#(#version 300 es
 precision highp float;
 
 in vec2 v_texcoord;
@@ -111,8 +109,7 @@ void main() {
     fragColor = texture(tex, v_texcoord);
 })#";
 
-inline const std::string FRAG_SRC_EXT = R"#(
-#version 300 es
+inline const std::string FRAG_SRC_EXT = R"#(#version 300 es
 #extension GL_OES_EGL_image_external_essl3 : require
 precision highp float;
 
