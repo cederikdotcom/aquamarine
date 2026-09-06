@@ -1,0 +1,68 @@
+{
+  "version": 1,
+  "upstream": {
+    "repo": "hyprwm/aquamarine",
+    "branch": "main"
+  },
+  "fork": {
+    "repo": "cederikdotcom/aquamarine",
+    "branch": "cpu-backend"
+  },
+  "baseline": {
+    "sha": "783bfd9ae441d1d0519b979ac68b73ddd6e81df0",
+    "ref": "v0.15.0"
+  },
+  "description": "One owner per custom path against the explicitly pinned upstream baseline. Current-main tree distance and graph backlog are reported separately, never presented as custom patch weight.",
+  "groups": [
+    {
+      "id": "shm-allocator",
+      "title": "CPU shared-memory allocator",
+      "status": "porting",
+      "pathspecs": [
+        "include/aquamarine/allocator/Allocator.hpp",
+        "include/aquamarine/allocator/Shm.hpp",
+        "src/allocator/Shm.cpp"
+      ],
+      "handling": "Adds the SHM allocator type and memfd/mmap-backed buffers with data-pointer access.",
+      "rationale": "Needed for sessionless and nested CPU rendering. Review format/stride/size bounds, failed allocation cleanup and buffer lifetime; converge when upstream supplies an equivalent allocator.",
+      "issue": 1
+    },
+    {
+      "id": "wayland-shm",
+      "title": "Nested Wayland without dmabuf",
+      "status": "upstreamable",
+      "pathspecs": [
+        "src/backend/Wayland.cpp"
+      ],
+      "handling": "Submits SHM buffers using wl_shm pools, handles missing dmabuf, advertises baseline formats and preserves an early configured output size.",
+      "rationale": "Hosts such as software-rendered Sway may provide no dmabuf. Split generic host compatibility fixes from allocator integration, then test configure timing, frame scheduling, buffer release and cursor paths.",
+      "issue": 2
+    },
+    {
+      "id": "drm-cpu",
+      "title": "CPU allocator selection and DRM scanout",
+      "status": "porting",
+      "pathspecs": [
+        "src/backend/Backend.cpp",
+        "src/backend/drm/DRM.cpp"
+      ],
+      "handling": "Selects AQ_FORCE_ALLOCATOR=shm/dumb, opens the primary node for dumb buffers, falls back to SHM without a DRM fd and skips the GL renderer for CPU allocators.",
+      "rationale": "The Mac needs KMS scanout without EGL/GBM rendering. Validate primary-node ownership, scanout/cursors, suspend/resume and unforced GBM behavior; keep until upstream has equivalent support.",
+      "issue": 3
+    },
+    {
+      "id": "fork-accounting",
+      "title": "Fork documentation and divergence tooling",
+      "status": "permanent",
+      "pathspecs": [
+        "README.md",
+        "docs/divergence.md",
+        ".github/divergence/",
+        ".github/workflows/divergence.yml"
+      ],
+      "handling": "Owns only fork documentation, accounting code, and its CI. Kept separate from runtime patch totals.",
+      "rationale": "Reviewable accounting should not masquerade as renderer code. Keep the reporter aligned with Omarchy's implementation.",
+      "issue": 4
+    }
+  ]
+}
