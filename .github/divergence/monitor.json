@@ -1,0 +1,8 @@
+{
+  "repo": "cederikdotcom/aquamarine",
+  "work_branch": "cpu-backend",
+  "upstream": "hyprwm/aquamarine",
+  "upstream_branches": [
+    "main"
+  ]
+}
